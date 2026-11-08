@@ -1,0 +1,13 @@
+services:
+  agent-control:
+    build: .
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      # Written to .env by `npm run install-hooks`
+      AGENT_CONTROL_TOKEN: ${AGENT_CONTROL_TOKEN:?run "npm run install-hooks" first to create .env}
+    volumes:
+      - agent-control-data:/app/data
+
+volumes:
+  agent-control-data:
