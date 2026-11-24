@@ -1,0 +1,498 @@
+// Review mode: pick a repo and a branch, optionally paste the ticket, and a read-only Claude Code
+// agent reviews the branch's changes in a throwaway git worktree. Findings come back as
+// structured JSON (claude -p --json-schema) and are kept in data/reviews.json.
+//
+// The review agent is an ordinary `claude` process, so the user's hooks show it on the dashboard
+// like any other session; the review records that session's id to link the two.
+import { execFile, spawn } from 'node:child_process'
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
+const CLAUDE = process.env.AGENT_CONTROL_CLAUDE || 'claude'
+const WORKTREES = process.env.AGENT_CONTROL_WORKTREES || path.join(os.tmpdir(), 'agent-control-reviews')
+const TIMEOUT_MS = Number(process.env.AGENT_CONTROL_REVIEW_TIMEOUT_MS) || 30 * 60 * 1000
+const MAX_REVIEWS = 100
+const MAX_RUNNING = 3
+const SEVERITIES = ['high', 'medium', 'low']
+const CATEGORIES = ['bug', 'security', 'ticket', 'performance', 'maintainability', 'tests']
+const VERDICTS = ['approve', 'comment', 'request_changes']
+const COVERAGE = ['yes', 'partly', 'no', 'unclear']
+const FINDING_STATUSES = new Set(['open', 'accepted', 'dismissed'])
+
+// Read-only: it can look at files and git history, and nothing else. dontAsk refuses the rest
+// instead of waiting for a prompt nobody would see.
+const ALLOWED_TOOLS = ['Read', 'Grep', 'Glob', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(git blame:*)']
+const DISALLOWED_TOOLS = ['Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch']
+
+const SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string', description: 'Two to four sentences: what the change does and your overall assessment.' },
+    verdict: { type: 'string', enum: VERDICTS },
+    ticket: {
+      type: 'object',
+      description: 'Only when a ticket description was given.',
+      properties: {
+        addressed: { type: 'string', enum: COVERAGE },
+        notes: { type: 'string', description: 'What is done, what is missing or different from the ticket.' },
+      },
+      required: ['addressed', 'notes'],
+    },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          severity: { type: 'string', enum: SEVERITIES },
+          category: { type: 'string', enum: CATEGORIES },
+          file: { type: 'string', description: 'Path relative to the repository root.' },
+          line: { type: 'integer', description: 'Line in the new version of the file.' },
+          title: { type: 'string', description: 'The problem in one short sentence.' },
+          detail: { type: 'string', description: 'Why it is a problem, pointing at the code.' },
+          scenario: { type: 'string', description: 'Concrete input or state, and the wrong result it leads to.' },
+          suggestion: { type: 'string', description: 'How to fix it, briefly.' },
+        },
+        required: ['severity', 'category', 'file', 'title', 'detail'],
+      },
+    },
+  },
+  required: ['summary', 'verdict', 'findings'],
+}
+
+const text = (v, n) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, n) : undefined)
+
+function git(cwd, args, maxBuffer = 20 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    execFile('git', ['-C', cwd, ...args], { maxBuffer, encoding: 'utf8' }, (err, stdout, stderr) => {
+      if (err) reject(new Error((stderr || err.message).trim().split('\n')[0].slice(0, 300)))
+      else resolve(stdout)
+    })
+  })
+}
+
+// A ref the user picked: never something git would read as an option.
+const refOk = (r) => typeof r === 'string' && r.length > 0 && r.length <= 200 && !r.startsWith('-') && !/[\s\0~^:?*[\\]/.test(r)
+
+function buildPrompt(r) {
+  const range = `${r.mergeBase}..${r.headSha}`
+  const ticket = r.ticket
+    ? `\n## Ticket\nThe change is meant to do what this ticket describes. Check whether it does: say in "ticket" how well it is covered, and report anything missing or done differently as findings with category "ticket".\n\n<ticket>\n${r.ticket}\n</ticket>\n`
+    : '\nNo ticket was given: leave out "ticket".\n'
+  return `You are reviewing the changes on branch \`${r.branch}\` compared with \`${r.base}\`.
+The working directory is a read-only checkout of the branch. Don't change any files.
+
+## The change
+- Commits: \`git log --oneline ${range}\`
+- Diff: \`git diff ${range}\` (add \`-- <path>\` for one file)
+- ${r.stat}
+${ticket}
+## What to look for
+Correctness bugs, security problems, missed requirements, broken edge cases and error handling, and
+risky changes without tests. Read the surrounding code and callers before you report something.
+Not style, naming or formatting.
+
+## How to report
+- Only report what you have verified in the code. A few real findings beat many guesses; none is fine.
+- "file" is relative to the repository root and "line" is a line in the new version of that file,
+  inside or next to the changed code.
+- "scenario" is concrete: which input or state, and what goes wrong.
+- severity: high = will break something or is a security hole; medium = a real bug in a less common
+  path or a clear gap; low = worth fixing but not urgent.
+- Write in the language the ticket is written in, or English if there is no ticket.`
+}
+
+// The hunk of `diff` (one file, unified format) that holds new-side line `line`, or the nearest.
+export function hunkFor(diff, line) {
+  const hunks = []
+  let cur
+  for (const l of diff.split('\n')) {
+    const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(l)
+    if (m) {
+      cur = { header: l, oldStart: +m[1], newStart: +m[3], newCount: m[4] === undefined ? 1 : +m[4], lines: [] }
+      hunks.push(cur)
+    } else if (cur && (l.startsWith(' ') || l.startsWith('+') || l.startsWith('-'))) cur.lines.push(l)
+  }
+  if (!hunks.length) return undefined
+  const dist = (h) => (line < h.newStart ? h.newStart - line : line >= h.newStart + h.newCount ? line - (h.newStart + h.newCount - 1) : 0)
+  const best = typeof line === 'number' ? hunks.reduce((a, b) => (dist(b) < dist(a) ? b : a)) : hunks[0]
+  if (typeof line === 'number' && dist(best) > 20) return undefined // about code the branch didn't touch
+  return { header: best.header, oldStart: best.oldStart, newStart: best.newStart, lines: best.lines.slice(0, 120) }
+}
+
+function cleanFindings(out, worktree) {
+  const list = Array.isArray(out?.findings) ? out.findings.slice(0, 60) : []
+  // The agent may give absolute paths, through symlinks or not (/var vs /private/var on macOS).
+  let real = worktree
+  try {
+    real = fs.realpathSync(worktree)
+  } catch {}
+  return list
+    .map((f) => {
+      let file = text(f?.file, 300)
+      for (const root of [worktree, real]) if (file?.startsWith(root + '/')) file = file.slice(root.length + 1)
+      file = file?.replace(/^\.\//, '')
+      return {
+        severity: SEVERITIES.includes(f?.severity) ? f.severity : 'medium',
+        category: CATEGORIES.includes(f?.category) ? f.category : 'bug',
+        file,
+        line: Number.isInteger(f?.line) && f.line > 0 ? f.line : undefined,
+        title: text(f?.title, 300),
+        detail: text(f?.detail, 4000),
+        scenario: text(f?.scenario, 2000),
+        suggestion: text(f?.suggestion, 2000),
+        status: 'open',
+      }
+    })
+    .filter((f) => f.title)
+    .sort((a, b) => SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity))
+    .map((f, i) => ({ id: `f${i + 1}`, ...f }))
+}
+
+export function createReviews({ dataDir, broadcast }) {
+  const FILE = path.join(dataDir, 'reviews.json')
+  /** @type {{repos: string[], reviews: object[]}} */
+  // repos: added by hand. seen: repos that sessions ran in (from the hooks' cwd), newest first.
+  let store = { repos: [], seen: [], reviews: [] }
+  const procs = new Map() // review id -> child process
+
+  try {
+    const s = JSON.parse(fs.readFileSync(FILE, 'utf8'))
+    if (Array.isArray(s?.repos)) store.repos = s.repos.filter((r) => typeof r === 'string')
+    if (Array.isArray(s?.seen)) store.seen = s.seen.filter((r) => typeof r === 'string')
+    if (Array.isArray(s?.reviews)) store.reviews = s.reviews.filter((r) => typeof r?.id === 'string')
+  } catch {} // first run
+  // Their process didn't survive the restart.
+  const orphans = store.reviews.filter((r) => r.status === 'running')
+  for (const r of orphans) {
+    r.status = 'failed'
+    r.error = 'The server restarted during the review'
+    r.endedAt = Date.now()
+    if (r.worktree) removeWorktree(r)
+  }
+  if (orphans.length) save()
+
+  function save() {
+    try {
+      fs.mkdirSync(dataDir, { recursive: true })
+      fs.writeFileSync(`${FILE}.tmp`, JSON.stringify(store), { mode: 0o600 })
+      fs.renameSync(`${FILE}.tmp`, FILE)
+    } catch (e) {
+      console.warn(`Could not save ${FILE}: ${e.message}`)
+    }
+  }
+
+  // What every dashboard viewer may see; the findings and the ticket need the token.
+  const summary = (r) => {
+    const open = r.findings?.filter((f) => f.status !== 'dismissed') ?? [] // accepted still needs fixing
+    return {
+      id: r.id,
+      repo: path.basename(r.repo),
+      branch: r.branch,
+      base: r.base,
+      status: r.status,
+      createdAt: r.createdAt,
+      endedAt: r.endedAt,
+      agentId: r.sessionId,
+      verdict: r.verdict,
+      counts: Object.fromEntries(SEVERITIES.map((s) => [s, open.filter((f) => f.severity === s).length])),
+      total: r.findings?.length ?? 0,
+    }
+  }
+  const publicList = () => store.reviews.map(summary)
+  const changed = () => {
+    save()
+    broadcast({ type: 'reviews', reviews: publicList() })
+  }
+
+  async function removeWorktree(r) {
+    try {
+      await git(r.repo, ['worktree', 'remove', '--force', r.worktree])
+    } catch {
+      fs.rmSync(r.worktree, { recursive: true, force: true })
+      await git(r.repo, ['worktree', 'prune']).catch(() => {})
+    }
+  }
+
+  async function addRepo(p) {
+    if (typeof p !== 'string' || !path.isAbsolute(p.replace(/^~(?=\/)/, os.homedir())) || p.length > 500)
+      throw new Error('Give the absolute path to a git repository')
+    const top = (await git(p.replace(/^~(?=\/)/, os.homedir()), ['rev-parse', '--show-toplevel']).catch(() => {
+      throw new Error(`Not a git repository: ${p}`)
+    })).trim()
+    if (!store.repos.includes(top)) store.repos.push(top), save()
+    return top
+  }
+
+  // Repos you run agents in count as known: the hooks report each session's folder.
+  const known = (repo) => store.repos.includes(repo) || store.seen.includes(repo)
+  const worktreeRoots = () => {
+    try {
+      return [WORKTREES, fs.realpathSync(WORKTREES)]
+    } catch {
+      return [WORKTREES]
+    }
+  }
+  const checked = new Map() // cwd -> its repo's top folder, or '' if none; once per server run
+  async function noteCwd(cwd) {
+    if (typeof cwd !== 'string' || !path.isAbsolute(cwd) || cwd.length > 500 || checked.has(cwd)) return
+    checked.set(cwd, '')
+    const top = (await git(cwd, ['rev-parse', '--show-toplevel']).catch(() => '')).trim()
+    checked.set(cwd, top)
+    // A review's own checkout is not a repo to offer.
+    if (!top || store.seen[0] === top || worktreeRoots().some((w) => top.startsWith(w + path.sep))) return
+    store.seen = [top, ...store.seen.filter((r) => r !== top)].slice(0, 50)
+    save()
+  }
+  const repoList = () => [
+    ...store.repos.map((r) => ({ path: r, name: path.basename(r), source: 'added' })),
+    ...store.seen.filter((r) => !store.repos.includes(r)).map((r) => ({ path: r, name: path.basename(r), source: 'session' })),
+  ]
+
+  async function branches(repo) {
+    if (!known(repo)) throw new Error('Unknown repository')
+    const out = await git(repo, ['for-each-ref', '--sort=-committerdate', '--format=%(refname:short)\t%(committerdate:unix)', 'refs/heads', 'refs/remotes'])
+    const all = out
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => {
+        const [name, at] = l.split('\t')
+        return { name, at: Number(at) * 1000 }
+      })
+      .filter((b) => b.name !== 'origin' && !b.name.endsWith('/HEAD'))
+    // origin/x is left out when there is a local x.
+    const localNames = new Set(all.filter((b) => !b.name.startsWith('origin/')).map((b) => b.name))
+    const list = all.filter((b) => !(b.name.startsWith('origin/') && localNames.has(b.name.slice(7))))
+    const names = new Set(list.map((b) => b.name))
+    let base = (await git(repo, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).catch(() => '')).trim()
+    if (names.has(base.replace(/^origin\//, ''))) base = base.replace(/^origin\//, '')
+    if (!names.has(base)) base = ['main', 'master', 'develop', 'trunk'].find((n) => names.has(n)) ?? list[0]?.name ?? ''
+    const current = (await git(repo, ['branch', '--show-current']).catch(() => '')).trim()
+    return { branches: list, base, current }
+  }
+
+  async function start(body) {
+    const repo = body?.repo
+    if (!known(repo)) throw new Error('Unknown repository: add it first')
+    const { branch, base } = body
+    if (!refOk(branch) || !refOk(base)) throw new Error('Pick a branch and a base branch')
+    if (branch === base) throw new Error('The branch and the base are the same')
+    if (procs.size >= MAX_RUNNING) throw new Error(`At most ${MAX_RUNNING} reviews can run at once`)
+    const sha = (ref) => git(repo, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).then((s) => s.trim(), () => { throw new Error(`No such branch: ${ref}`) })
+    const headSha = await sha(branch)
+    const baseSha = await sha(base)
+    const mergeBase = (await git(repo, ['merge-base', baseSha, headSha])).trim()
+    if (mergeBase === headSha) throw new Error(`${branch} has no changes that aren't already in ${base}`)
+    const stat = (await git(repo, ['diff', '--shortstat', mergeBase, headSha])).trim() || 'No file changes'
+
+    const id = crypto.randomBytes(4).toString('hex')
+    const slug = (s) => s.replace(/[^\w.-]+/g, '-').slice(0, 40)
+    const r = {
+      id,
+      repo,
+      branch,
+      base,
+      headSha,
+      baseSha,
+      mergeBase,
+      stat,
+      ticket: text(body.ticket, 20000),
+      sessionId: crypto.randomUUID(),
+      worktree: path.join(WORKTREES, `${slug(path.basename(repo))}-review-${slug(branch)}-${id}`),
+      status: 'running',
+      createdAt: Date.now(),
+      findings: [],
+    }
+    fs.mkdirSync(WORKTREES, { recursive: true })
+    await git(repo, ['worktree', 'add', '--detach', r.worktree, headSha])
+    store.reviews.unshift(r)
+    store.reviews = store.reviews.slice(0, MAX_REVIEWS)
+    changed()
+    run(r)
+    return r
+  }
+
+  function finish(r, change) {
+    procs.delete(r.id)
+    if (r.status !== 'running') return // cancelled meanwhile
+    Object.assign(r, change, { endedAt: Date.now() })
+    removeWorktree(r).finally(changed)
+  }
+
+  function run(r) {
+    const args = [
+      '-p',
+      '--output-format', 'json',
+      '--json-schema', JSON.stringify(SCHEMA),
+      '--session-id', r.sessionId,
+      '--name', `Review: ${r.branch}`.slice(0, 40),
+      '--permission-mode', 'dontAsk',
+      '--allowedTools', ...ALLOWED_TOOLS,
+      '--disallowedTools', ...DISALLOWED_TOOLS,
+    ]
+    let child
+    try {
+      child = spawn(CLAUDE, args, { cwd: r.worktree, stdio: ['pipe', 'pipe', 'pipe'], env: process.env })
+    } catch (e) {
+      return finish(r, { status: 'failed', error: `Could not start ${CLAUDE}: ${e.message}` })
+    }
+    procs.set(r.id, child)
+    let out = ''
+    let err = ''
+    child.stdout.on('data', (c) => (out = (out + c).slice(-5_000_000)))
+    child.stderr.on('data', (c) => (err = (err + c).slice(-4000)))
+    child.stdin.on('error', () => {})
+    child.stdin.end(buildPrompt(r))
+    const timer = setTimeout(() => child.kill('SIGTERM'), TIMEOUT_MS).unref()
+    child.on('error', (e) => {
+      clearTimeout(timer)
+      const missing = e.code === 'ENOENT'
+      finish(r, {
+        status: 'failed',
+        error: missing
+          ? `Could not find "${CLAUDE}". Review mode needs Claude Code installed where the server runs (not inside Docker).`
+          : `Could not start ${CLAUDE}: ${e.message}`,
+      })
+    })
+    child.on('close', async (code, signal) => {
+      clearTimeout(timer)
+      if (!procs.has(r.id)) return // 'error' already finished it
+      let res
+      try {
+        res = JSON.parse(out)
+      } catch {}
+      const so = res?.structured_output
+      if (!so || res.is_error) {
+        const why = signal
+          ? `Stopped after ${Math.round(TIMEOUT_MS / 60000)} minutes`
+          : text(res?.result, 600) ?? text(err, 1500) ?? `claude exited with code ${code}`
+        return finish(r, { status: 'failed', error: why, cost: res?.total_cost_usd })
+      }
+      const findings = cleanFindings(so, r.worktree)
+      // The diff around each finding, from the commits (the worktree is about to go).
+      const diffs = new Map()
+      for (const f of findings) {
+        if (!f.file) continue
+        if (!diffs.has(f.file)) diffs.set(f.file, await git(r.repo, ['diff', '-U4', r.mergeBase, r.headSha, '--', f.file]).catch(() => ''))
+        f.hunk = hunkFor(diffs.get(f.file), f.line)
+      }
+      finish(r, {
+        status: 'done',
+        summary: text(so.summary, 4000),
+        verdict: VERDICTS.includes(so.verdict) ? so.verdict : 'comment',
+        ticketCoverage:
+          r.ticket && so.ticket && COVERAGE.includes(so.ticket.addressed)
+            ? { addressed: so.ticket.addressed, notes: text(so.ticket.notes, 4000) }
+            : undefined,
+        findings,
+        cost: typeof res.total_cost_usd === 'number' ? res.total_cost_usd : undefined,
+        turns: res.num_turns,
+      })
+    })
+  }
+
+  function cancel(r) {
+    const child = procs.get(r.id)
+    procs.delete(r.id)
+    child?.kill('SIGTERM')
+    if (r.status === 'running') {
+      Object.assign(r, { status: 'cancelled', endedAt: Date.now() })
+      removeWorktree(r).finally(changed)
+    }
+  }
+
+  const find = (id) => store.reviews.find((r) => r.id === id)
+  // The full review, without where it ran on disk.
+  const full = (r) => {
+    const { worktree, ...rest } = r
+    return { ...rest, ...summary(r), repoPath: r.repo }
+  }
+
+  function readJson(req, limit) {
+    return new Promise((resolve) => {
+      let body = ''
+      req.on('data', (c) => {
+        body += c
+        if (body.length > limit) req.destroy()
+      })
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(body))
+        } catch {
+          resolve(undefined)
+        }
+      })
+    })
+  }
+
+  // Routes under /api/review*; the caller has checked the token. Returns false if not ours.
+  function handle(req, res, url, json, sameOrigin) {
+    const p = url.pathname
+    if (!p.startsWith('/api/review')) return false
+    const write = req.method !== 'GET'
+    if (write && !sameOrigin()) return req.resume(), json(403, { error: 'cross-origin' }), true
+    const fail = (e) => json(400, { error: e.message })
+
+    if (p === '/api/review/repos' && req.method === 'GET') return json(200, repoList()), true
+    if (p === '/api/review/repos' && req.method === 'POST') {
+      readJson(req, 4096).then(async (b) => {
+        try {
+          if (b?.remove) {
+            store.repos = store.repos.filter((r) => r !== b.remove)
+            store.seen = store.seen.filter((r) => r !== b.remove)
+            save()
+            return json(200, { repos: repoList() })
+          }
+          const added = await addRepo(b?.path)
+          json(200, { added, repos: repoList() })
+        } catch (e) {
+          fail(e)
+        }
+      })
+      return true
+    }
+    if (p === '/api/review/branches' && req.method === 'GET') {
+      branches(url.searchParams.get('repo') ?? '').then((b) => json(200, b), fail)
+      return true
+    }
+    if (p === '/api/reviews' && req.method === 'GET') return json(200, publicList()), true
+    if (p === '/api/reviews' && req.method === 'POST') {
+      readJson(req, 65536).then((b) => start(b).then((r) => json(200, full(r)), fail))
+      return true
+    }
+    const m = /^\/api\/reviews\/(\w{1,16})(?:\/findings\/(\w{1,16}))?$/.exec(p)
+    const r = m && find(m[1])
+    if (m && !r) return req.resume(), json(404, { error: 'no such review' }), true
+    if (m && !m[2] && req.method === 'GET') return json(200, full(r)), true
+    if (m && !m[2] && req.method === 'DELETE') {
+      cancel(r)
+      store.reviews = store.reviews.filter((x) => x !== r)
+      changed()
+      return json(200, { ok: true }), true
+    }
+    if (m && !m[2] && req.method === 'POST') {
+      // {cancel: true}: stop a running review but keep it in the list.
+      readJson(req, 1024).then((b) => {
+        if (!b?.cancel) return json(400, { error: 'expected {"cancel": true}' })
+        cancel(r)
+        json(200, full(r))
+      })
+      return true
+    }
+    if (m && m[2] && req.method === 'POST') {
+      readJson(req, 1024).then((b) => {
+        const f = r.findings?.find((x) => x.id === m[2])
+        if (!f) return json(404, { error: 'no such finding' })
+        if (!FINDING_STATUSES.has(b?.status)) return json(400, { error: 'status must be open | accepted | dismissed' })
+        f.status = b.status
+        changed()
+        json(200, full(r))
+      })
+      return true
+    }
+    return req.resume(), json(404, { error: 'not found' }), true
+  }
+
+  return { handle, publicList, noteCwd, shutdown: () => [...procs.values()].forEach((c) => c.kill('SIGTERM')) }
+}

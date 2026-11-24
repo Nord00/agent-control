@@ -8,6 +8,8 @@ import type { ApprovalDetail, Decision, PendingApproval, Settings } from './Appr
 import ListView from './ListView'
 import Recent from './Recent'
 import type { RecentSession } from './Recent'
+import ReviewView from './Review'
+import type { ReviewSummary } from './Review'
 import { STATUS_LABEL, applyEvent, initialAgents, step } from './sim'
 import type { Agent, AgentEvent, App as AgentApp } from './sim'
 import * as Icon from './Icons'
@@ -47,9 +49,12 @@ function writePref(key: string, value: string) {
   } catch {}
 }
 
-// Two ways to see the same sessions: the node map, or an expandable list.
-type Layout = 'map' | 'list'
-const readLayout = (): Layout => (readPref('ac.layout') === 'list' ? 'list' : 'map')
+// Two ways to see the same sessions (the node map, or an expandable list), and the reviews.
+type Layout = 'map' | 'list' | 'review'
+const readLayout = (): Layout => {
+  const v = readPref('ac.layout')
+  return v === 'list' || v === 'review' ? v : 'map'
+}
 
 const notificationsSupported = () => typeof Notification !== 'undefined'
 
@@ -143,9 +148,10 @@ interface PanelProps {
   removedSubagents: number
   onShowSubagents: () => void
   approvals: ReactNode
+  onOpenReview?: () => void // set when this agent is a review's agent
 }
 
-function Panel({ agent, agents, onClose, onStage, canShow, onHide, onShow, removedSubagents, onShowSubagents, approvals }: PanelProps) {
+function Panel({ agent, agents, onClose, onStage, canShow, onHide, onShow, removedSubagents, onShowSubagents, approvals, onOpenReview }: PanelProps) {
   const [, tick] = useState(0)
   useEffect(() => {
     const t = setInterval(() => tick((n) => n + 1), 1000)
@@ -234,6 +240,11 @@ function Panel({ agent, agents, onClose, onStage, canShow, onHide, onShow, remov
       )}
 
       <div className="panel-actions">
+        {onOpenReview && (
+          <button className="panel-button" onClick={onOpenReview}>
+            <Icon.Review /> Open review
+          </button>
+        )}
         {onStage ? (
           <button className="panel-button" onClick={onHide}>
             <Icon.EyeOff /> Remove from dashboard
@@ -288,6 +299,12 @@ export default function App() {
   const [approvalDetails, setApprovalDetails] = useState<Record<string, ApprovalDetail>>({})
   const [token, setToken] = useState(() => readPref('ac.token') ?? '')
   const [settings, setSettings] = useState<Settings | null>(null)
+  const [reviews, setReviews] = useState<ReviewSummary[]>([])
+  const [selectedReview, setSelectedReview] = useState<string | null>(() => readPref('ac.review'))
+  const selectReview = (id: string | null) => {
+    setSelectedReview(id)
+    writePref('ac.review', id ?? '')
+  }
   const changeToken = (t: string) => {
     setToken(t)
     writePref('ac.token', t)
@@ -413,6 +430,8 @@ export default function App() {
           setAgents((l) => applyEvent(l, m.agent as AgentEvent, true))
         } else if (m.type === 'settings') {
           setSettings(m.settings as Settings)
+        } else if (m.type === 'reviews') {
+          setReviews(m.reviews as ReviewSummary[])
         } else if (m.type === 'approvals') {
           setApprovals(m.approvals as PendingApproval[])
         } else if (m.type === 'remove') {
@@ -611,7 +630,7 @@ export default function App() {
 
       <div
         ref={stageRef}
-        className={`stage${layout === 'list' ? ' hidden' : ''}`}
+        className={`stage${layout !== 'map' ? ' hidden' : ''}`}
         style={{
           backgroundSize: `${40 * view.k}px ${40 * view.k}px`,
           backgroundPosition: `${view.x}px ${view.y}px`,
@@ -659,7 +678,19 @@ export default function App() {
         <ListView agents={visible} selected={selected} now={now} onSelect={setSelected} approvalCards={approvalCards} />
       )}
 
-      {visible.length === 0 && (
+      {layout === 'review' && (
+        <ReviewView
+          token={token}
+          onUnlock={changeToken}
+          reviews={reviews}
+          agents={byId}
+          selected={reviews.some((r) => r.id === selectedReview) ? selectedReview : null}
+          onSelect={selectReview}
+          onShowAgent={setSelected}
+        />
+      )}
+
+      {visible.length === 0 && layout !== 'review' && (
         <div className="empty">
           <h2>No active agents</h2>
           <p>
@@ -764,6 +795,9 @@ export default function App() {
           <button aria-pressed={layout === 'list'} aria-label="List view" title="List view" onClick={() => changeLayout('list')}>
             <Icon.List />
           </button>
+          <button aria-pressed={layout === 'review'} aria-label="Reviews" title="Reviews" onClick={() => changeLayout('review')}>
+            <Icon.Review />
+          </button>
         </span>
       </div>
 
@@ -802,6 +836,16 @@ export default function App() {
           removedSubagents={removedUnder(sel).length}
           onShowSubagents={() => showOnStage(removedUnder(sel).map((a) => a.id))}
           approvals={approvalCards([sel.id], false)}
+          onOpenReview={(() => {
+            const r = reviews.find((x) => x.agentId === sel.id)
+            return r
+              ? () => {
+                  selectReview(r.id)
+                  changeLayout('review')
+                  setSelected(null)
+                }
+              : undefined
+          })()}
         />
       )}
     </>

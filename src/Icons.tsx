@@ -159,3 +159,17 @@ export const Shield = () => (
     <path d="M12 8.5v4M12 15.5v.01" />
   </Svg>
 )
+export const Plus = () => (
+  <Svg>
+    <path d="M12 5v14M5 12h14" />
+  </Svg>
+)
+export const Review = () => (
+  <Svg>
+    <path d="M8 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h5" />
+    <path d="M16 4h2a2 2 0 0 1 2 2v4" />
+    <path d="M8 4.5h8v-.5a1 1 0 0 0-1-1H9a1 1 0 0 0-1 1Z" />
+    <circle cx="16.5" cy="16.5" r="3.5" />
+    <path d="m19 19 2.5 2.5M8 10h6M8 14h3" />
+  </Svg>
+)

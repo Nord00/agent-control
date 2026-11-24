@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { METRICS, TURN_COMPLETE, mapHook } from './claude.js'
+import { createReviews } from './review.js'
 
 const PORT = Number(process.env.PORT) || 3000
 const TOKEN = process.env.AGENT_CONTROL_TOKEN || ''
@@ -342,10 +343,18 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/settings') return json(200, settings)
 
-  if (url.pathname === '/events' || url.pathname === '/api/agents' || url.pathname.startsWith('/api/approvals') || url.pathname === '/api/settings') {
+  if (
+    url.pathname === '/events' ||
+    url.pathname === '/api/agents' ||
+    url.pathname.startsWith('/api/approvals') ||
+    url.pathname === '/api/settings' ||
+    url.pathname.startsWith('/api/review')
+  ) {
     if (!TOKEN) return req.resume(), json(503, { error: 'AGENT_CONTROL_TOKEN is not set on the server' })
     if (!authorized(req)) return req.resume(), json(401, { error: 'unauthorized' })
   }
+
+  if (reviews.handle(req, res, url, json, sameOrigin)) return
 
   if (req.method === 'POST' && url.pathname === '/events') {
     let body = ''
@@ -362,6 +371,7 @@ const server = http.createServer((req, res) => {
       }
       // Claude Code hook payload, or a plain agent event
       const isHook = typeof ev?.hook_event_name === 'string'
+      if (isHook) reviews.noteCwd(ev.cwd) // offers the session's repo for reviews
       const events = isHook ? mapHook(ev, agents) : [ev]
       if (!events) return json(400, { error: 'unsupported hook payload' })
       let last
@@ -496,15 +506,18 @@ server.on('upgrade', (req, socket) => {
   send(socket, { type: 'snapshot', agents: [...agents.values()] })
   send(socket, { type: 'approvals', approvals: [...approvals.values()].map(publicApproval) })
   send(socket, { type: 'settings', settings })
+  send(socket, { type: 'reviews', reviews: reviews.publicList() })
 })
 
 load()
 loadSettings()
+const reviews = createReviews({ dataDir: path.dirname(DATA_FILE), broadcast })
 prune()
 setInterval(prune, 60 * 60 * 1000).unref()
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => {
     if (saveTimer) saveNow()
+    reviews.shutdown()
     process.exit(0)
   })
 }

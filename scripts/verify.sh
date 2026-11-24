@@ -21,7 +21,38 @@ step "Server smoke test"
 PORT=$((40000 + RANDOM % 10000))
 TOKEN=verify-test-token
 DATA=$(mktemp -d)/agents.json
-PORT=$PORT AGENT_CONTROL_TOKEN=$TOKEN AGENT_CONTROL_DATA=$DATA node server/index.js >/tmp/verify-server.log 2>&1 &
+# Review mode runs this stand-in for claude: it reports what it was given and returns fixed findings.
+REVIEW_TMP=$(mktemp -d)
+WORKTREES=$REVIEW_TMP/worktrees
+STUB=$REVIEW_TMP/claude-stub.mjs
+cat >"$STUB" <<'JS'
+#!/usr/bin/env node
+import fs from 'node:fs'
+let prompt = ''
+process.stdin.on('data', (c) => (prompt += c)).on('end', () => {
+  const args = process.argv.slice(2)
+  if (prompt.includes('PLEASE-FAIL')) {
+    process.stderr.write('stub: asked to fail\n')
+    process.exit(3)
+  }
+  const allowed = args.slice(args.indexOf('--allowedTools') + 1, args.indexOf('--disallowedTools'))
+  const info = [
+    `worktree=${fs.existsSync('app.js')}`,
+    `mode=${args[args.indexOf('--permission-mode') + 1]}`,
+    `writes=${allowed.some((t) => /^(Write|Edit)$/.test(t))}`,
+    `ticket=${prompt.includes('TICKET-TEXT')}`,
+    `schema=${args.includes('--json-schema')}`,
+  ].join(' ')
+  const findings = [
+    { severity: 'low', category: 'maintainability', file: 'app.js', line: 1, title: 'Low one', detail: 'd' },
+    { severity: 'high', category: 'bug', file: `${process.cwd()}/app.js`, line: 3, title: 'Divides by zero', detail: 'd', scenario: 'b = 0' },
+  ]
+  console.log(JSON.stringify({ type: 'result', is_error: false, total_cost_usd: 0.01, num_turns: 2, structured_output: { summary: info, verdict: 'request_changes', ticket: { addressed: 'partly', notes: 'n' }, findings } }))
+})
+JS
+chmod +x "$STUB"
+PORT=$PORT AGENT_CONTROL_TOKEN=$TOKEN AGENT_CONTROL_DATA=$DATA AGENT_CONTROL_CLAUDE=$STUB AGENT_CONTROL_WORKTREES=$WORKTREES \
+  node server/index.js >/tmp/verify-server.log 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null' EXIT
 for _ in $(seq 1 30); do curl -s -o /dev/null "http://localhost:$PORT/" && break; sleep 0.2; done
@@ -187,6 +218,88 @@ curl -s -o /dev/null -X POST "$base/api/approvals/$hc" -H "$auth" -d '{"decision
 wait $HPID
 got=$(jget 'JSON.stringify(v.hookSpecificOutput.decision)' <"$OUT")
 [ "$got" = '{"behavior":"allow"}' ] && ok "Codex gets a bare allow (no updatedInput)" || bad "codex allow output: '$got'"
+
+step "Review mode"
+REPO=$REVIEW_TMP/demo-repo
+g() { git -C "$REPO" -c user.name=verify -c user.email=verify@example.invalid "$@"; }
+git init -q -b main "$REPO"
+printf 'export function ratio(a, b) {\n  if (b === 0) return 0\n  return a / b\n}\n' >"$REPO/app.js"
+g add app.js && g commit -qm base
+g checkout -qb feature
+printf 'export function ratio(a, b) {\n  // no guard any more\n  return a / b\n}\n' >"$REPO/app.js"
+g commit -qam change
+g checkout -q main
+rpost() { curl -s -X POST "$base$1" -H "$auth" -H 'Content-Type: application/json' -d "$2"; }
+rwait() { # $1 review id -> final status
+  for _ in $(seq 1 50); do
+    st=$(curl -s "$base/api/reviews/$1" -H "$auth" | jget v.status)
+    [ "$st" != running ] && break
+    sleep 0.2
+  done
+  echo "$st"
+}
+
+code=$(curl -s -o /dev/null -w '%{http_code}' "$base/api/reviews")
+[ "$code" = 401 ] && ok "GET /api/reviews without token -> 401" || bad "GET /api/reviews without token -> $code (want 401)"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/review/repos" -H "$auth" -d '{"path":"/no/such/repo"}')
+[ "$code" = 400 ] && ok "Adding a path that isn't a git repo -> 400" || bad "add non-repo -> $code (want 400)"
+added=$(rpost /api/review/repos "{\"path\":\"$REPO\"}" | jget v.added)
+REPO_TOP=$(git -C "$REPO" rev-parse --show-toplevel)
+[ "$added" = "$REPO_TOP" ] && ok "Adding a git repo -> listed by its top folder" || bad "add repo: '$added' (want $REPO_TOP)"
+br=$(curl -s -G "$base/api/review/branches" --data-urlencode "repo=$REPO_TOP" -H "$auth" | jget 'v.base+" "+v.branches.map(b=>b.name).sort().join()')
+[ "$br" = "main feature,main" ] && ok "Branches listed with main as the default base" || bad "branches: '$br' (want 'main feature,main')"
+REPO2=$REVIEW_TMP/session-repo
+git init -q -b main "$REPO2" && mkdir -p "$REPO2/sub"
+git -C "$REPO2" -c user.name=verify -c user.email=verify@example.invalid commit -q --allow-empty -m init
+REPO2_TOP=$(git -C "$REPO2" rev-parse --show-toplevel)
+curl -s -o /dev/null -X POST "$base/events" -H "$auth" -d "{\"app\":\"claude\",\"session_id\":\"verify-repo-session\",\"hook_event_name\":\"SessionStart\",\"cwd\":\"$REPO2/sub\"}"
+src=""
+for _ in $(seq 1 20); do
+  src=$(curl -s "$base/api/review/repos" -H "$auth" | jget 'v.find(r=>r.path==="'"$REPO2_TOP"'")?.source')
+  [ -n "$src" ] && break
+  sleep 0.1
+done
+br=$(curl -s -G "$base/api/review/branches" --data-urlencode "repo=$REPO2_TOP" -H "$auth" | jget 'v.base')
+[ "$src" = session ] && [ "$br" = main ] && ok "A session's repo is offered for review without adding it" || bad "session repo: source '$src', branches base '$br'"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/reviews" -H "$auth" -d "{\"repo\":\"$REPO_TOP\",\"branch\":\"main\",\"base\":\"main\"}")
+[ "$code" = 400 ] && ok "Reviewing a branch against itself -> 400" || bad "same branch review -> $code (want 400)"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/reviews" -H "$auth" -d "{\"repo\":\"$REPO_TOP\",\"branch\":\"--output=x\",\"base\":\"main\"}")
+[ "$code" = 400 ] && ok "A branch name that looks like an option -> 400" || bad "option-like branch -> $code (want 400)"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/reviews" -H "$auth" -H 'Origin: http://evil.example' -d "{\"repo\":\"$REPO_TOP\",\"branch\":\"feature\",\"base\":\"main\"}")
+[ "$code" = 403 ] && ok "Starting a review from another origin -> 403" || bad "cross-origin review -> $code (want 403)"
+
+rid=$(rpost /api/reviews "{\"repo\":\"$REPO_TOP\",\"branch\":\"feature\",\"base\":\"main\",\"ticket\":\"TICKET-TEXT: keep the guard\"}" | jget v.id)
+st=$(rwait "$rid")
+rv=$(curl -s "$base/api/reviews/$rid" -H "$auth")
+[ "$st" = done ] && ok "Review runs and finishes" || bad "review status: '$st' ($(echo "$rv" | jget v.error))"
+got=$(echo "$rv" | jget v.summary)
+[ "$got" = "worktree=true mode=dontAsk writes=false ticket=true schema=true" ] \
+  && ok "Review agent runs read-only in a checkout of the branch, with the ticket and the schema" || bad "what the agent got: '$got'"
+got=$(echo "$rv" | jget 'v.findings.map(f=>f.severity+":"+f.file+":"+f.line).join()')
+[ "$got" = "high:app.js:3,low:app.js:1" ] && ok "Findings sorted by severity, paths relative to the repo" || bad "findings: '$got'"
+got=$(echo "$rv" | jget 'v.findings[0].hunk.lines.includes("-  if (b === 0) return 0")')
+[ "$got" = true ] && ok "Each finding carries the diff hunk around its line" || bad "hunk: $(echo "$rv" | jget 'v.findings[0].hunk')"
+got=$(echo "$rv" | jget '[v.verdict,v.ticketCoverage.addressed,/^[0-9a-f-]{36}$/.test(v.agentId)].join()')
+[ "$got" = "request_changes,partly,true" ] && ok "Verdict, ticket coverage and the agent's session id are kept" || bad "review fields: '$got'"
+left=$(ls -A "$WORKTREES" 2>/dev/null | wc -l | tr -d ' ')
+wtl=$(git -C "$REPO_TOP" worktree list | wc -l | tr -d ' ')
+[ "$left" = 0 ] && [ "$wtl" = 1 ] && ok "The review's worktree is removed afterwards" || bad "worktrees left: $left on disk, $wtl in git"
+
+got=$(rpost "/api/reviews/$rid/findings/f1" '{"status":"dismissed"}' | jget '[v.findings[0].status,v.counts.high,v.counts.low].join()')
+[ "$got" = "dismissed,0,1" ] && ok "Dismissing a finding takes it out of the open counts" || bad "dismiss: '$got' (want dismissed,0,1)"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/reviews/$rid/findings/f1" -H "$auth" -d '{"status":"maybe"}')
+[ "$code" = 400 ] && ok "Unknown finding status -> 400" || bad "bad finding status -> $code (want 400)"
+got=$(curl -s "$base/api/reviews" -H "$auth" | jget 'v[0].id+" "+(v[0].findings===undefined)')
+[ "$got" = "$rid true" ] && ok "Review list has summaries without the findings" || bad "review list: '$got'"
+
+fid=$(rpost /api/reviews "{\"repo\":\"$REPO_TOP\",\"branch\":\"feature\",\"base\":\"main\",\"ticket\":\"PLEASE-FAIL\"}" | jget v.id)
+st=$(rwait "$fid")
+err=$(curl -s "$base/api/reviews/$fid" -H "$auth" | jget v.error)
+[ "$st" = failed ] && [ "$err" = "stub: asked to fail" ] && ok "A failing review agent ends as failed with its error" || bad "failing review: '$st' '$err'"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$base/api/reviews/$fid" -H "$auth")
+gone=$(curl -s -o /dev/null -w '%{http_code}' "$base/api/reviews/$fid" -H "$auth")
+[ "$code" = 200 ] && [ "$gone" = 404 ] && ok "Deleting a review removes it" || bad "delete review: $code, then $gone"
 
 step "Startup cleanup of saved helper subagents"
 GDIR=$(mktemp -d)
