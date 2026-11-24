@@ -176,11 +176,23 @@ try {
   const p = JSON.parse(raw)
   // Codex expects JSON (not nothing) from these; {} changes nothing.
   if (app === 'codex' && (p.hook_event_name === 'Stop' || p.hook_event_name === 'SubagentStop')) fs.writeSync(1, '{}\n')
+  // Codex forks short-lived helper sessions (e.g. to name a new chat) that it keeps no history
+  // for: transcript_path is null on every one of their events. They aren't work to show.
+  if (app === 'codex' && p.transcript_path === null) done()
 
   let cfg = {}
   try {
     cfg = JSON.parse(fs.readFileSync(path.join(acDir, 'config.json'), 'utf8'))
   } catch {}
+  // Troubleshooting: "debugLog": true in config.json appends each payload to debug.jsonl here,
+  // minus prompts, tool input/output and replies.
+  if (cfg.debugLog === true) {
+    try {
+      const { prompt, tool_input, tool_response, last_assistant_message, ...meta } = p
+      const line = JSON.stringify({ at: new Date().toISOString(), app, ...meta, omitted: Object.keys({ prompt, tool_input, tool_response, last_assistant_message }).filter((k) => p[k] !== undefined) })
+      fs.appendFileSync(path.join(acDir, 'debug.jsonl'), line + '\n', { mode: 0o600 })
+    } catch {}
+  }
   const url = process.env.AGENT_CONTROL_URL || cfg.url
   const token = process.env.AGENT_CONTROL_TOKEN || cfg.token
   if (!url || !token) done()

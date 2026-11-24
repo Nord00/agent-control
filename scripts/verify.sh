@@ -96,6 +96,15 @@ curl -s -o /dev/null -X POST "$base/events" -H "$auth" -d '{"app":"claude","sess
 left=$(curl -s "$base/api/approvals" -H "$auth" | jget 'v.length')
 [ "$left" = 0 ] && ok "Turn ending drops its pending approvals" || bad "after Stop, $left approvals still pending"
 
+step "Hook script"
+HOOK_HOME=$(mktemp -d) # no real config.json
+hook() { printf '%s' "$2" | HOME=$HOOK_HOME AGENT_CONTROL_URL=$base AGENT_CONTROL_TOKEN=$TOKEN node hooks/claude-hook.mjs $1 >/dev/null; }
+hook codex '{"session_id":"verify-codex-real","hook_event_name":"SessionStart","cwd":"/tmp/x","transcript_path":"/tmp/x.jsonl","source":"startup"}'
+hook codex '{"session_id":"verify-codex-fork","hook_event_name":"SessionStart","cwd":"/tmp/x","transcript_path":null,"source":"fork"}'
+ids=$(curl -s "$base/api/agents" -H "$auth" | jget 'v.map(a=>a.id).join(" ")')
+case " $ids " in *" verify-codex-real "*) ok "Codex session shows up" ;; *) bad "Codex session missing: $ids" ;; esac
+case " $ids " in *" verify-codex-fork "*) bad "Codex helper session (no transcript) was shown" ;; *) ok "Codex helper session without transcript is ignored" ;; esac
+
 if [ $fail -ne 0 ]; then echo; echo "Server log:"; tail -20 /tmp/verify-server.log; fi
 
 echo
