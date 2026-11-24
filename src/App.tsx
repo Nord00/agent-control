@@ -3,14 +3,15 @@ import type { ReactNode } from 'react'
 import AgentNode from './AgentNode'
 import { APP_LABEL, TOKENS_NOTE, appOf, fmtCost, fmtDuration, fmtTokens, isRetired, modelName, newTokens, retiredAt, rootOf, sumUsage, totalTokens, withDescendants } from './format'
 import { footprint, relocate, setStageRule } from './layout'
-import { ApprovalCard } from './Approvals'
-import type { ApprovalDetail, PendingApproval } from './Approvals'
+import { ApprovalCard, ApprovalSettings } from './Approvals'
+import type { ApprovalDetail, Decision, PendingApproval, Settings } from './Approvals'
 import ListView from './ListView'
 import Recent from './Recent'
 import type { RecentSession } from './Recent'
 import { STATUS_LABEL, applyEvent, initialAgents, step } from './sim'
 import type { Agent, AgentEvent, App as AgentApp } from './sim'
 import * as Icon from './Icons'
+import { useDismiss } from './useDismiss'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
 
@@ -150,6 +151,9 @@ function Panel({ agent, agents, onClose, onStage, canShow, onHide, onShow, remov
     const t = setInterval(() => tick((n) => n + 1), 1000)
     return () => clearInterval(t)
   }, [])
+  const ref = useRef<HTMLElement>(null)
+  // The map closes it on its own click, and must not when you drag to pan.
+  useDismiss(ref, onClose, true, (t) => !!t.closest('.stage'))
   const parent = agents.find((a) => a.id === agent.parentId)
   const children = agents.filter((a) => a.parentId === agent.id)
   const app = appOf(rootOf(agent, new Map(agents.map((a) => [a.id, a]))))
@@ -161,7 +165,7 @@ function Panel({ agent, agents, onClose, onStage, canShow, onHide, onShow, remov
   const contextPct =
     agent.contextTokens && agent.contextWindow ? Math.min(100, (agent.contextTokens / agent.contextWindow) * 100) : null
   return (
-    <aside className="panel card">
+    <aside className="panel card" ref={ref}>
       <button className="close" onClick={onClose} aria-label="Close">
         <Icon.Close />
       </button>
@@ -283,6 +287,7 @@ export default function App() {
   const [approvals, setApprovals] = useState<PendingApproval[]>([])
   const [approvalDetails, setApprovalDetails] = useState<Record<string, ApprovalDetail>>({})
   const [token, setToken] = useState(() => readPref('ac.token') ?? '')
+  const [settings, setSettings] = useState<Settings | null>(null)
   const changeToken = (t: string) => {
     setToken(t)
     writePref('ac.token', t)
@@ -406,6 +411,8 @@ export default function App() {
         } else if (m.type === 'agent') {
           trackApprovals(m.agent as AgentEvent, true)
           setAgents((l) => applyEvent(l, m.agent as AgentEvent, true))
+        } else if (m.type === 'settings') {
+          setSettings(m.settings as Settings)
         } else if (m.type === 'approvals') {
           setApprovals(m.approvals as PendingApproval[])
         } else if (m.type === 'remove') {
@@ -444,18 +451,32 @@ export default function App() {
     }
   }, [missing, token]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const decide = async (id: string, decision: 'allow' | 'deny') => {
+  const decide = async (id: string, decision: Decision, answers?: Record<string, string>) => {
     const r = await fetch(`/api/approvals/${encodeURIComponent(id)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ decision }),
+      body: JSON.stringify({ decision, answers }),
     })
     if (r.status === 401) {
       changeToken('')
       throw new Error('The token was not accepted')
     }
     if (r.status === 404) throw new Error('Already answered in the terminal, or it timed out')
-    if (!r.ok) throw new Error(`Could not send the answer (${r.status})`)
+    if (!r.ok) throw new Error((await r.json().catch(() => null))?.error ?? `Could not send the answer (${r.status})`)
+  }
+
+  const changeApprovals = async (approvals: Partial<Settings['approvals']>) => {
+    const r = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ approvals }),
+    })
+    if (r.status === 401) {
+      changeToken('')
+      throw new Error('The token was not accepted')
+    }
+    if (!r.ok) throw new Error(`Could not save (${r.status})`)
+    setSettings((await r.json()) as Settings)
   }
 
   // Approval cards for these agents, oldest first.
@@ -692,6 +713,7 @@ export default function App() {
             ))}
           </span>
         )}
+        {!demo && <ApprovalSettings settings={settings} hasToken={!!token} onUnlock={changeToken} onChange={changeApprovals} />}
         {notificationsSupported() && !demo && (
           <button
             className={`tool${notifyOn ? ' active' : ''}`}

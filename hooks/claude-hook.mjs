@@ -141,22 +141,40 @@ function approvalPreview(p) {
   const summary = [patch, cmd, ti.file_path, ti.url, ti.pattern, ti.path].find((v) => typeof v === 'string' && v)
   let details
   if (typeof cmd === 'string' && Object.keys(ti).every((k) => k === 'command' || k === 'description')) details = cmd
+  else if (typeof ti.plan === 'string') details = ti.plan // ExitPlanMode
   else details = JSON.stringify(ti, null, 2)
   return {
     tool: typeof p.tool_name === 'string' ? p.tool_name.slice(0, 100) : 'tool',
     summary: summary?.split('\n')[0].slice(0, 200),
     description: typeof ti.description === 'string' ? ti.description.slice(0, 300) : undefined,
     details: details?.slice(0, 8000),
+    questions: questionsOf(p),
   }
 }
 
-const decisionOutput = (behavior) =>
-  JSON.stringify({
-    hookSpecificOutput: {
-      hookEventName: 'PermissionRequest',
-      decision: behavior === 'deny' ? { behavior, message: 'Denied from Agent Control.' } : { behavior },
-    },
-  })
+// Claude Code's AskUserQuestion: multiple-choice questions the dashboard can answer.
+function questionsOf(p) {
+  if (p.tool_name !== 'AskUserQuestion' || !Array.isArray(p.tool_input?.questions)) return
+  return p.tool_input.questions.slice(0, 4).map((q) => ({
+    question: String(q?.question ?? '').slice(0, 500),
+    header: typeof q?.header === 'string' ? q.header.slice(0, 40) : undefined,
+    multiSelect: q?.multiSelect === true,
+    options: (Array.isArray(q?.options) ? q.options : []).slice(0, 8).map((o) => ({
+      label: String(o?.label ?? '').slice(0, 200),
+      description: typeof o?.description === 'string' ? o.description.slice(0, 300) : undefined,
+    })),
+  }))
+}
+
+// Claude Code wants the tool's input back on "allow" (AskUserQuestion and ExitPlanMode need it;
+// answers ride along). Codex rejects updatedInput, so it gets the bare decision.
+function decisionOutput(behavior, p, answers) {
+  const decision = { behavior }
+  if (behavior === 'deny') decision.message = 'Denied from Agent Control.'
+  else if (app === 'claude' && p.tool_input && typeof p.tool_input === 'object')
+    decision.updatedInput = answers ? { ...p.tool_input, answers } : p.tool_input
+  return JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } })
+}
 
 // Codex PostModelRequest: token counts for one request attempt, numbers only.
 function requestUsage(u) {
@@ -252,8 +270,9 @@ try {
       headers,
       signal: AbortSignal.timeout(waitS * 1000 + 2000),
     })
-    const decision = r.ok ? (await r.json())?.decision : undefined
-    if (decision === 'allow' || decision === 'deny') fs.writeSync(1, decisionOutput(decision) + '\n')
+    const answer = r.ok ? await r.json() : undefined
+    const answers = answer?.answers && typeof answer.answers === 'object' ? answer.answers : undefined
+    if (answer?.decision === 'allow' || answer?.decision === 'deny') fs.writeSync(1, decisionOutput(answer.decision, p, answers) + '\n')
   }
 } catch {
   // Agent Control unavailable or bad input: ignore.

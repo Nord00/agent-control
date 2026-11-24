@@ -135,13 +135,44 @@ function frame(text) {
 // Memory only: commands and patches can hold secrets, so they are never saved, and only clients
 // with the token can read them. Everyone else sees which agent waits on which tool, as before.
 const MAX_APPROVAL_WAIT_MS = 120_000
-/** @type {Map<string, {id: string, agentId: string, sessionId: string, app: string, tool: string, summary?: string, description?: string, details?: string, createdAt: number, expiresAt: number, timer: any, waiter?: (d: string | null) => void}>} */
+/** @type {Map<string, {id: string, agentId: string, sessionId: string, app: string, tool: string, summary?: string, description?: string, details?: string, questions?: object[], createdAt: number, expiresAt: number, timer: any, waiter?: (r: {decision: string | null, answers?: object}) => void}>} */
 const approvals = new Map()
-const publicApproval = (a) => ({ id: a.id, agentId: a.agentId, tool: a.tool, createdAt: a.createdAt, expiresAt: a.expiresAt })
-const fullApproval = (a) => ({ ...publicApproval(a), sessionId: a.sessionId, app: a.app, summary: a.summary, description: a.description, details: a.details })
+const kindOf = (a) => (a.questions ? 'question' : 'permission')
+const publicApproval = (a) => ({ id: a.id, agentId: a.agentId, tool: a.tool, kind: kindOf(a), createdAt: a.createdAt, expiresAt: a.expiresAt })
+const fullApproval = (a) => ({ ...publicApproval(a), sessionId: a.sessionId, app: a.app, summary: a.summary, description: a.description, details: a.details, questions: a.questions })
 const broadcastApprovals = () => broadcast({ type: 'approvals', approvals: [...approvals.values()].map(publicApproval) })
 
 const text = (v, n) => (typeof v === 'string' && v ? v.slice(0, n) : undefined)
+
+// AskUserQuestion from Claude Code: 1-4 questions with options; anything else is ignored.
+function cleanQuestions(list) {
+  if (!Array.isArray(list)) return undefined
+  const out = list
+    .slice(0, 4)
+    .map((q) => ({
+      question: text(q?.question, 500),
+      header: text(q?.header, 40),
+      multiSelect: q?.multiSelect === true,
+      options: (Array.isArray(q?.options) ? q.options : [])
+        .slice(0, 8)
+        .map((o) => ({ label: text(o?.label, 200), description: text(o?.description, 300) }))
+        .filter((o) => o.label),
+    }))
+    .filter((q) => q.question)
+  return out.length ? out : undefined
+}
+
+// Answers keyed by question text, one per question: an option label, labels joined with ", "
+// for multi-select, or free text. Returns an error message, or nothing if they fit.
+function badAnswers(questions, answers) {
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) return 'answers are required for questions'
+  const known = new Set(questions.map((q) => q.question))
+  for (const [k, v] of Object.entries(answers)) {
+    if (!known.has(k)) return `unknown question: ${k.slice(0, 80)}`
+    if (typeof v !== 'string' || !v.trim() || v.length > 2000) return 'each answer must be text (1-2000 characters)'
+  }
+  if (Object.keys(answers).length !== known.size) return 'every question needs an answer'
+}
 
 function createApproval(agentId, sessionId, app, a) {
   const id = crypto.randomUUID()
@@ -156,6 +187,7 @@ function createApproval(agentId, sessionId, app, a) {
     summary: text(a.summary, 200),
     description: text(a.description, 300),
     details: text(a.details, 8000),
+    questions: cleanQuestions(a.questions),
     createdAt: now,
     expiresAt: now + wait,
     // Ends just before the hook's own timeout, so the hook gets a clean "no decision".
@@ -167,26 +199,50 @@ function createApproval(agentId, sessionId, app, a) {
 }
 
 // Ends an approval: tells the waiting hook (decision or null = "use the normal prompt").
-function closeApproval(id, decision) {
+function closeApproval(id, decision, answers) {
   const a = approvals.get(id)
   if (!a) return null
   approvals.delete(id)
   clearTimeout(a.timer)
-  a.waiter?.(decision)
+  a.waiter?.({ decision, answers })
   broadcastApprovals()
   return a
 }
 
 // The agent moved on without us (answered in the terminal, turn over): drop what it waited on.
+// --- Settings: which apps ask the dashboard before showing their own approval prompt ---
+// Codex can't show its prompt while the hook waits, so it starts off; Claude Code shows both.
+const SETTINGS_FILE = path.join(path.dirname(DATA_FILE), 'settings.json')
+const DEFAULT_SETTINGS = { approvals: { claude: true, codex: false } }
+let settings = structuredClone(DEFAULT_SETTINGS)
+function loadSettings() {
+  try {
+    const s = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
+    for (const app of ['claude', 'codex'])
+      if (typeof s?.approvals?.[app] === 'boolean') settings.approvals[app] = s.approvals[app]
+  } catch {} // first run, or unreadable: defaults
+}
+function saveSettings() {
+  try {
+    fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true })
+    fs.writeFileSync(`${SETTINGS_FILE}.tmp`, JSON.stringify(settings), { mode: 0o600 })
+    fs.renameSync(`${SETTINGS_FILE}.tmp`, SETTINGS_FILE)
+  } catch (e) {
+    console.warn(`Could not save ${SETTINGS_FILE}: ${e.message}`)
+  }
+}
+
 function dropApprovals(match) {
   for (const a of [...approvals.values()]) if (match(a)) closeApproval(a.id, null)
 }
 
-function decide(id, decision) {
-  const a = closeApproval(id, decision)
+// decision "pass" hands the request back to the app's own prompt, without answering it.
+function decide(id, decision, answers) {
+  const a = closeApproval(id, decision === 'pass' ? null : decision, answers)
   if (!a) return null
+  if (decision === 'pass') return a
   const more = [...approvals.values()].some((o) => o.agentId === a.agentId)
-  const verb = decision === 'allow' ? 'Approved' : 'Denied'
+  const verb = a.questions ? (decision === 'allow' ? 'Answered' : 'Declined') : decision === 'allow' ? 'Approved' : 'Denied'
   if (agents.has(a.agentId))
     upsert(
       more
@@ -254,7 +310,19 @@ const server = http.createServer((req, res) => {
   // Liveness probe: no token required, reveals nothing about agents.
   if (req.method === 'GET' && url.pathname === '/health') return json(200, { ok: true })
 
-  if (url.pathname === '/events' || url.pathname === '/api/agents' || url.pathname.startsWith('/api/approvals')) {
+  // Browsers send Origin; refuse other sites even if they somehow hold the token.
+  const sameOrigin = () => {
+    if (!req.headers.origin) return true
+    try {
+      return new URL(req.headers.origin).host === req.headers.host
+    } catch {
+      return false
+    }
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/settings') return json(200, settings)
+
+  if (url.pathname === '/events' || url.pathname === '/api/agents' || url.pathname.startsWith('/api/approvals') || url.pathname === '/api/settings') {
     if (!TOKEN) return req.resume(), json(503, { error: 'AGENT_CONTROL_TOKEN is not set on the server' })
     if (!authorized(req)) return req.resume(), json(401, { error: 'unauthorized' })
   }
@@ -292,8 +360,10 @@ const server = http.createServer((req, res) => {
         dropApprovals((a) => a.agentId === (ev.agent_id ?? sid) && a.tool === ev.tool_name)
       let approval
       const asking = events.findLast((e) => e.attention)
-      if (hook === 'PermissionRequest' && asking && ev.approval && typeof ev.approval === 'object')
-        approval = createApproval(asking.id, sid, ev.app === 'codex' ? 'codex' : 'claude', ev.approval)
+      const app = ev.app === 'codex' ? 'codex' : 'claude'
+      // Turned off for this app: no approval id, so the hook returns at once and the app asks.
+      if (hook === 'PermissionRequest' && asking && ev.approval && typeof ev.approval === 'object' && settings.approvals[app])
+        approval = createApproval(asking.id, sid, app, ev.approval)
       json(200, { ok: true, updates: events.length, approval })
     })
     return
@@ -302,15 +372,40 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/approvals') return json(200, [...approvals.values()].map(fullApproval))
 
+  if (req.method === 'POST' && url.pathname === '/api/settings') {
+    if (!sameOrigin()) return req.resume(), json(403, { error: 'cross-origin' })
+    let body = ''
+    req.on('data', (c) => {
+      body += c
+      if (body.length > 1024) req.destroy()
+    })
+    req.on('end', () => {
+      let change
+      try {
+        change = JSON.parse(body)
+      } catch {}
+      const ap = change?.approvals
+      if (!ap || typeof ap !== 'object' || !Object.entries(ap).every(([k, v]) => (k === 'claude' || k === 'codex') && typeof v === 'boolean'))
+        return json(400, { error: 'expected {"approvals": {"claude"?: boolean, "codex"?: boolean}}' })
+      Object.assign(settings.approvals, ap)
+      saveSettings()
+      // Turned off: hand what's waiting back to the app's own prompt right away.
+      dropApprovals((a) => !settings.approvals[a.app])
+      broadcast({ type: 'settings', settings })
+      json(200, settings)
+    })
+    return
+  }
+
   const am = /^\/api\/approvals\/([\w-]{1,64})(\/wait)?$/.exec(url.pathname)
   if (am && req.method === 'GET' && am[2]) {
     // The hook long-polls here until someone decides or the wait runs out.
     const a = approvals.get(am[1])
     if (!a) return json(404, { error: 'no such approval' })
     let answered = false
-    a.waiter = (decision) => {
+    a.waiter = (result) => {
       answered = true
-      json(200, { decision })
+      json(200, result)
     }
     // The hook gave up or was killed: the normal prompt is up, so stop offering the buttons.
     res.on('close', () => {
@@ -322,26 +417,25 @@ const server = http.createServer((req, res) => {
     return
   }
   if (am && req.method === 'POST' && !am[2]) {
-    // Browsers send Origin; refuse other sites even if they somehow hold the token.
-    if (req.headers.origin) {
-      try {
-        if (new URL(req.headers.origin).host !== req.headers.host) return req.resume(), json(403, { error: 'cross-origin' })
-      } catch {
-        return req.resume(), json(403, { error: 'bad origin' })
-      }
-    }
+    if (!sameOrigin()) return req.resume(), json(403, { error: 'cross-origin' })
     let body = ''
     req.on('data', (c) => {
       body += c
-      if (body.length > 1024) req.destroy()
+      if (body.length > 32768) req.destroy()
     })
     req.on('end', () => {
-      let decision
+      let decision, answers
       try {
-        decision = JSON.parse(body)?.decision
+        ;({ decision, answers } = JSON.parse(body) ?? {})
       } catch {}
-      if (decision !== 'allow' && decision !== 'deny') return json(400, { error: 'decision must be allow | deny' })
-      const a = decide(am[1], decision)
+      if (!['allow', 'deny', 'pass'].includes(decision)) return json(400, { error: 'decision must be allow | deny | pass' })
+      const pending = approvals.get(am[1])
+      if (!pending) return json(404, { error: 'already answered or expired' })
+      if (pending.questions && decision === 'allow') {
+        const bad = badAnswers(pending.questions, answers)
+        if (bad) return json(400, { error: bad })
+      } else answers = undefined
+      const a = decide(am[1], decision, answers)
       if (!a) return json(404, { error: 'already answered or expired' })
       json(200, { ok: true, id: a.id, decision })
     })
@@ -381,9 +475,11 @@ server.on('upgrade', (req, socket) => {
   })
   send(socket, { type: 'snapshot', agents: [...agents.values()] })
   send(socket, { type: 'approvals', approvals: [...approvals.values()].map(publicApproval) })
+  send(socket, { type: 'settings', settings })
 })
 
 load()
+loadSettings()
 prune()
 setInterval(prune, 60 * 60 * 1000).unref()
 for (const sig of ['SIGINT', 'SIGTERM']) {

@@ -185,7 +185,7 @@ button:focus-visible { outline: 2px solid #9fb0ff; outline-offset: 2px; }
   position: fixed;
   top: 20px;
   left: 28px;
-  right: 290px;
+  right: 340px;
   display: flex;
   align-items: center;
   gap: 14px;
@@ -211,7 +211,8 @@ button:focus-visible { outline: 2px solid #9fb0ff; outline-offset: 2px; }
 .stat + .stat::before { content: '·'; margin-right: 14px; color: var(--faint); }
 .stat.alert { color: var(--waiting); font-weight: 600; }
 .tool.active { color: var(--waiting); }
-.topbar.has-filter { right: 510px; }
+.ap-settings .tool.active { color: var(--completed); }
+.topbar.has-filter { right: 560px; }
 
 /* Recent sessions */
 .recent {
@@ -278,7 +279,7 @@ button:focus-visible { outline: 2px solid #9fb0ff; outline-offset: 2px; }
 .recent-meta { font-size: 12px; color: var(--muted); }
 
 /* View controls */
-.tools { position: fixed; top: 22px; right: 24px; display: flex; gap: 8px; }
+.tools { position: fixed; top: 22px; right: 24px; display: flex; gap: 8px; z-index: 15; } /* above the list view and Recent, so its popovers are too */
 
 /* Which app's sessions to show */
 .app-filter { display: flex; gap: 2px; height: 40px; padding: 3px; border-radius: 12px; }
@@ -660,6 +661,98 @@ button:focus-visible { outline: 2px solid #9fb0ff; outline-offset: 2px; }
   font: inherit;
 }
 .ap-unlock .panel-button:disabled { opacity: 0.5; cursor: default; }
+.ap-pass { display: block; margin: 8px 0 -4px auto; font-size: 12px; }
+.ap-pass:disabled { opacity: 0.5; cursor: default; }
+.ap-questions { display: grid; gap: 14px; margin-top: 12px; }
+.ap-q { margin: 0; padding: 0; border: 0; min-width: 0; }
+.ap-q legend { padding: 0; margin-bottom: 8px; font-size: 14px; line-height: 1.4; color: var(--text); }
+.ap-q legend small { color: var(--muted); }
+.ap-q-header {
+  display: inline-block;
+  margin-right: 8px;
+  padding: 1px 7px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: 1px;
+}
+.ap-options { display: grid; gap: 6px; }
+.ap-option {
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.04);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.ap-option:hover { background: rgba(255, 255, 255, 0.08); }
+.ap-option[aria-pressed='true'] { border-color: var(--completed); background: rgba(47, 224, 173, 0.12); }
+.ap-option b { font-size: 13px; font-weight: 600; }
+.ap-option span { font-size: 12px; color: var(--muted); line-height: 1.4; }
+.ap-other {
+  width: 100%;
+  height: 34px;
+  margin-top: 6px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+.ap-questions .ap-actions { margin-top: 0; }
+.ap-settings { position: relative; }
+.ap-settings-pop {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(320px, calc(100vw - 32px));
+  padding: 16px;
+  border-radius: 16px;
+  background: rgba(13, 18, 37, 0.97);
+  z-index: 20;
+  animation: fadeIn 0.15s ease-out;
+}
+.ap-settings-pop h2 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
+.ap-settings-pop .hint { line-height: 1.45; }
+.ap-settings-pop ul { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 4px; }
+.ap-settings-pop label { display: flex; align-items: center; gap: 12px; padding: 8px 6px; border-radius: 10px; cursor: pointer; }
+.ap-settings-pop label:hover { background: rgba(255, 255, 255, 0.05); }
+.ap-settings-pop label > span { flex: 1; display: grid; gap: 2px; font-size: 14px; }
+.ap-settings-pop small { font-size: 12px; color: var(--muted); line-height: 1.4; }
+.ap-settings-pop input[role='switch'] {
+  appearance: none;
+  flex: none;
+  position: relative;
+  width: 36px;
+  height: 20px;
+  margin: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.15);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.ap-settings-pop input[role='switch']::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.15s;
+}
+.ap-settings-pop input[role='switch']:checked { background: var(--completed); }
+.ap-settings-pop input[role='switch']:checked::after { transform: translateX(16px); }
+.ap-settings-pop input[role='switch']:focus-visible { outline: 2px solid #9fb0ff; outline-offset: 2px; }
 button.stat { pointer-events: auto; background: none; border: 0; padding: 0; font: inherit; font-size: 14px; cursor: pointer; }
 button.stat:hover { text-decoration: underline; }
 

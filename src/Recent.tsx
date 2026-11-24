@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { RETIRE_MS, fmtAgo, fmtCost } from './format'
 import type { Agent } from './sim'
 import * as Icon from './Icons'
+import { useDismiss } from './useDismiss'
 
 export interface RecentSession {
   agent: Agent
@@ -19,9 +20,11 @@ interface Props {
 
 export default function Recent({ sessions, now, onOpen, onShow, onClear }: Props) {
   const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  useDismiss(ref, () => setOpen(false), open && sessions.length > 0)
   if (!sessions.length) return null
   return (
-    <div className="recent">
+    <div className="recent" ref={ref}>
       {open && (
         <div className="recent-list card">
           <div className="recent-head">
