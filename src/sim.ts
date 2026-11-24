@@ -1,4 +1,5 @@
 export type Status = 'working' | 'waiting' | 'completed'
+export type App = 'claude' | 'codex'
 
 import { placeChild, placeRoot } from './layout'
 
@@ -24,11 +25,12 @@ export interface Metrics {
   prompts?: number
   lastEventAt?: number
   attention?: boolean // blocked on a tool approval
+  app?: App // which tool runs the session; unset for plain events
 }
 
 const METRIC_KEYS = [
   'model', 'effort', 'branch', 'requests', 'contextTokens', 'contextWindow',
-  'tokens', 'cost', 'costPartial', 'toolCalls', 'prompts', 'lastEventAt', 'attention',
+  'tokens', 'cost', 'costPartial', 'toolCalls', 'prompts', 'lastEventAt', 'attention', 'app',
 ] as const
 
 const metricsOf = (ev: Metrics) => {
@@ -85,8 +87,9 @@ function demoMetrics(model: string, scale: number): Metrics {
     cacheRead: Math.round(900000 * scale),
     cacheWrite: Math.round(60000 * scale),
   }
-  const m = /sonnet/.test(model) ? 0.5 : /haiku/.test(model) ? 0.05 : 1
+  const m = /sonnet|sol/.test(model) ? 0.5 : /haiku|luna/.test(model) ? 0.05 : 1
   return {
+    app: model.startsWith('gpt-') ? 'codex' : 'claude',
     model,
     effort: 'high',
     branch: 'main',
@@ -118,7 +121,7 @@ function makeChild(list: Agent[], parent: Agent, status: Status, fresh: boolean)
     startedAt: now,
     endedAt: status === 'completed' ? now : undefined,
     fresh,
-    ...demoMetrics('claude-haiku-5-5', 0.05 + rand(0.2)),
+    ...demoMetrics(parent.app === 'codex' ? 'gpt-6-luna' : 'claude-haiku-5-5', 0.05 + rand(0.2)),
   }
 }
 
@@ -200,7 +203,7 @@ export function initialAgents(): Agent[] {
 
   let list: Agent[] = [
     root('refactor-auth', 'Refactoring auth middleware to use session tokens', 'working', -520, -150, 110, 260000, 'claude-opus-5-5', 1.4),
-    root('write-tests', 'Adding integration tests for the billing API', 'waiting', 480, -210, 110, 540000, 'claude-sonnet-5-5', 0.8),
+    root('write-tests', 'Adding integration tests for the billing API', 'waiting', 480, -210, 110, 540000, 'gpt-6.1-sol', 0.8),
     root('docs-sync', 'Syncing README with current CLI flags', 'completed', 40, 370, 110, 900000, 'claude-haiku-5-5', 0.3),
   ]
   const kid = (parentIdx: number, status: Status) => {

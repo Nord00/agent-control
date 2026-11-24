@@ -1,4 +1,4 @@
-import type { Agent, Tokens } from './sim'
+import type { Agent, App, Tokens } from './sim'
 
 export const totalTokens = (t?: Tokens) => (t ? t.input + t.output + t.cacheRead + t.cacheWrite : 0)
 
@@ -55,13 +55,23 @@ export function fmtDuration(ms: number) {
   return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
 }
 
-// "claude-opus-5-5-20260401" -> "Opus 5.5". Anything unrecognized is shown as is.
+const title = (s: string) => s.replace(/(^|-)([a-z])/g, (_, sep: string, c: string) => `${sep ? ' ' : ''}${c.toUpperCase()}`)
+
+// "claude-opus-5-5-20260401" -> "Opus 5.5", "gpt-5.3-codex" -> "GPT-5.3 Codex".
+// Anything unrecognized is shown as is.
 export function modelName(id?: string) {
   if (!id) return '—'
   const m = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(?:\[.*\])?$/.exec(id)
-  if (!m) return id
-  return `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}${m[3] ? `.${m[3]}` : ''}`
+  if (m) return `${title(m[1])} ${m[2]}${m[3] ? `.${m[3]}` : ''}`
+  const g = /^gpt-([\d.]+)((?:-[a-z]+)*?)(?:-\d{4}-\d{2}-\d{2})?$/.exec(id)
+  if (g) return `GPT-${g[1]}${g[2] ? ` ${title(g[2].slice(1))}` : ''}`
+  return id
 }
+
+export const APP_LABEL: Record<App, string> = { claude: 'Claude Code', codex: 'Codex' }
+
+// Sessions saved before apps were recorded all came from Claude Code hooks.
+export const appOf = (a: Agent): App | undefined => a.app ?? (a.model?.startsWith('claude-') ? 'claude' : undefined)
 
 export interface Rollup {
   tokens: Tokens

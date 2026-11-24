@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import AgentNode from './AgentNode'
-import { TOKENS_NOTE, fmtCost, fmtDuration, fmtTokens, isRetired, modelName, newTokens, retiredAt, rootOf, sumUsage, totalTokens, withDescendants } from './format'
+import { APP_LABEL, TOKENS_NOTE, appOf, fmtCost, fmtDuration, fmtTokens, isRetired, modelName, newTokens, retiredAt, rootOf, sumUsage, totalTokens, withDescendants } from './format'
 import { footprint, relocate, setStageRule } from './layout'
+import { ApprovalCard } from './Approvals'
+import type { ApprovalDetail, PendingApproval } from './Approvals'
+import ListView from './ListView'
 import Recent from './Recent'
 import type { RecentSession } from './Recent'
 import { STATUS_LABEL, applyEvent, initialAgents, step } from './sim'
-import type { Agent, AgentEvent } from './sim'
+import type { Agent, AgentEvent, App as AgentApp } from './sim'
 import * as Icon from './Icons'
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
@@ -16,7 +19,18 @@ const TOP_BAR = 84
 const BOTTOM_BAR = 96
 const MAX_FIT_ZOOM = 1.3
 
-const COST_NOTE = 'Estimated at Anthropic API list prices. Subscription plans are not billed per token.'
+const COST_NOTE = 'Estimated at Anthropic and OpenAI API list prices. Subscription plans are not billed per token.'
+
+type AppFilter = 'all' | AgentApp
+const APP_FILTERS: [AppFilter, string, string][] = [
+  ['all', 'All', 'All sessions'],
+  ['claude', 'Claude', 'Claude Code sessions only'],
+  ['codex', 'Codex', 'Codex sessions only'],
+]
+const readAppFilter = (): AppFilter => {
+  const v = readPref('ac.app')
+  return v === 'claude' || v === 'codex' ? v : 'all'
+}
 
 // Per-browser preferences: storage can be unavailable, and the page must work without it.
 function readPref(key: string) {
@@ -31,6 +45,10 @@ function writePref(key: string, value: string) {
     localStorage.setItem(key, value)
   } catch {}
 }
+
+// Two ways to see the same sessions: the node map, or an expandable list.
+type Layout = 'map' | 'list'
+const readLayout = (): Layout => (readPref('ac.layout') === 'list' ? 'list' : 'map')
 
 const notificationsSupported = () => typeof Notification !== 'undefined'
 
@@ -123,9 +141,10 @@ interface PanelProps {
   onShow: () => void
   removedSubagents: number
   onShowSubagents: () => void
+  approvals: ReactNode
 }
 
-function Panel({ agent, agents, onClose, onStage, canShow, onHide, onShow, removedSubagents, onShowSubagents }: PanelProps) {
+function Panel({ agent, agents, onClose, onStage, canShow, onHide, onShow, removedSubagents, onShowSubagents, approvals }: PanelProps) {
   const [, tick] = useState(0)
   useEffect(() => {
     const t = setInterval(() => tick((n) => n + 1), 1000)
@@ -133,6 +152,7 @@ function Panel({ agent, agents, onClose, onStage, canShow, onHide, onShow, remov
   }, [])
   const parent = agents.find((a) => a.id === agent.parentId)
   const children = agents.filter((a) => a.parentId === agent.id)
+  const app = appOf(rootOf(agent, new Map(agents.map((a) => [a.id, a]))))
   const end = agent.endedAt ?? Date.now()
   const family = withDescendants(agent, agents)
   const usage = sumUsage(family)
@@ -150,9 +170,11 @@ function Panel({ agent, agents, onClose, onStage, canShow, onHide, onShow, remov
         <i>{agent.status === 'completed' && <Icon.Check />}</i>
         {agent.ended ? 'Session ended' : agent.attention ? 'Needs approval' : STATUS_LABEL[agent.status]}
       </div>
+      {approvals}
       <p className="task">{agent.task}</p>
 
       <div className="rows">
+        {app && <Row icon={<Icon.Code />} label="App">{APP_LABEL[app]}</Row>}
         <Row icon={<Icon.Layers />} label="Type">
           {agent.depth === 0 ? 'Root agent' : 'Subagent'}
         </Row>
@@ -245,12 +267,26 @@ export default function App() {
   const touched = useRef(false) // once the user pans or zooms, stop auto-fitting
   const [now, setNow] = useState(() => Date.now())
   const [clearedBefore, setClearedBefore] = useState(() => Number(readPref('ac.clearedBefore')) || 0)
+  const [appFilter, setAppFilter] = useState(readAppFilter)
+  const [layout, setLayout] = useState(readLayout)
+  const changeLayout = (l: Layout) => {
+    setLayout(l)
+    writePref('ac.layout', l)
+    touched.current = false // reframe the map when coming back to it
+  }
   const [notifyOn, setNotifyOn] = useState(
     () => readPref('ac.notify') === 'on' && notificationsSupported() && Notification.permission === 'granted',
   )
   const notifyOnRef = useRef(notifyOn)
   notifyOnRef.current = notifyOn
   const needingApproval = useRef(new Set<string>())
+  const [approvals, setApprovals] = useState<PendingApproval[]>([])
+  const [approvalDetails, setApprovalDetails] = useState<Record<string, ApprovalDetail>>({})
+  const [token, setToken] = useState(() => readPref('ac.token') ?? '')
+  const changeToken = (t: string) => {
+    setToken(t)
+    writePref('ac.token', t)
+  }
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 15000)
@@ -264,18 +300,28 @@ export default function App() {
 
   const byId = new Map(agents.map((a) => [a.id, a]))
   const sel = selected ? byId.get(selected) : undefined
+  // The app filter only hides sessions; layout still places nodes around all of them, so
+  // switching back never overlaps anything.
+  const apps = new Set(agents.filter((a) => !a.parentId).map(appOf))
+  const showFilter = apps.size > 1 || appFilter !== 'all'
+  const shown = (a: Agent) => appFilter === 'all' || appOf(rootOf(a, byId)) === appFilter
+  const changeAppFilter = (f: AppFilter) => {
+    setAppFilter(f)
+    writePref('ac.app', f)
+    touched.current = false // frame what's left
+  }
   // Retired or removed sessions leave the stage for the Recent list until cleared in this browser.
-  const visible = agents.filter((a) => isOnStage(a, byId, overrides, now))
+  const visible = agents.filter((a) => shown(a) && isOnStage(a, byId, overrides, now))
   const isCleared = (root: Agent) => !sessionOnStage(root, overrides, now) && leftStageAt(root, overrides) <= clearedBefore
   const recent: RecentSession[] = agents
-    .filter((a) => !a.parentId && !sessionOnStage(a, overrides, now) && !isCleared(a))
+    .filter((a) => !a.parentId && shown(a) && !sessionOnStage(a, overrides, now) && !isCleared(a))
     .map((a) => ({
       agent: a,
       reason: removedAt(a, overrides) !== null ? ('Removed' as const) : a.ended ? ('Ended' as const) : ('Inactive' as const),
       at: leftStageAt(a, overrides),
     }))
     .sort((a, b) => b.at - a.at)
-  const counted = agents.filter((a) => !isCleared(rootOf(a, byId))) // what the totals cover
+  const counted = agents.filter((a) => shown(a) && !isCleared(rootOf(a, byId))) // what the totals cover
 
   const changeOverrides = (change: (o: Overrides) => void) => {
     const next = { ...overridesRef.current }
@@ -360,6 +406,8 @@ export default function App() {
         } else if (m.type === 'agent') {
           trackApprovals(m.agent as AgentEvent, true)
           setAgents((l) => applyEvent(l, m.agent as AgentEvent, true))
+        } else if (m.type === 'approvals') {
+          setApprovals(m.approvals as PendingApproval[])
         } else if (m.type === 'remove') {
           setAgents((l) => l.filter((a) => a.id !== m.id))
         }
@@ -376,6 +424,60 @@ export default function App() {
       ws?.close()
     }
   }, [demo, trackApprovals])
+
+  // The command behind each approval: only readable with the token.
+  const missing = approvals.filter((a) => !approvalDetails[a.id]).map((a) => a.id).join()
+  useEffect(() => {
+    if (!token || !missing) return
+    let stale = false
+    fetch('/api/approvals', { headers: { Authorization: `Bearer ${token}` } })
+      .then(async (r) => {
+        if (stale) return
+        if (r.status === 401) return changeToken('') // wrong or rotated token: ask again
+        if (!r.ok) return
+        const list = (await r.json()) as ApprovalDetail[]
+        setApprovalDetails(Object.fromEntries(list.map((a) => [a.id, a])))
+      })
+      .catch(() => {})
+    return () => {
+      stale = true
+    }
+  }, [missing, token]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const decide = async (id: string, decision: 'allow' | 'deny') => {
+    const r = await fetch(`/api/approvals/${encodeURIComponent(id)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ decision }),
+    })
+    if (r.status === 401) {
+      changeToken('')
+      throw new Error('The token was not accepted')
+    }
+    if (r.status === 404) throw new Error('Already answered in the terminal, or it timed out')
+    if (!r.ok) throw new Error(`Could not send the answer (${r.status})`)
+  }
+
+  // Approval cards for these agents, oldest first.
+  const approvalCards = (ids: string[], named: boolean) => {
+    const list = approvals.filter((a) => ids.includes(a.agentId)).sort((a, b) => a.createdAt - b.createdAt)
+    if (!list.length) return null
+    return (
+      <div className="ap-list">
+        {list.map((a) => (
+          <ApprovalCard
+            key={a.id}
+            approval={a}
+            detail={approvalDetails[a.id]}
+            hasToken={!!token}
+            onUnlock={changeToken}
+            onDecide={decide}
+            agentName={named ? byId.get(a.agentId)?.name : undefined}
+          />
+        ))}
+      </div>
+    )
+  }
 
   useEffect(() => {
     const el = stageRef.current!
@@ -488,7 +590,7 @@ export default function App() {
 
       <div
         ref={stageRef}
-        className="stage"
+        className={`stage${layout === 'list' ? ' hidden' : ''}`}
         style={{
           backgroundSize: `${40 * view.k}px ${40 * view.k}px`,
           backgroundPosition: `${view.x}px ${view.y}px`,
@@ -532,14 +634,24 @@ export default function App() {
         </div>
       </div>
 
+      {layout === 'list' && (
+        <ListView agents={visible} selected={selected} now={now} onSelect={setSelected} approvalCards={approvalCards} />
+      )}
+
       {visible.length === 0 && (
         <div className="empty">
           <h2>No active agents</h2>
-          <p>{live ? 'Start a Claude Code session and it will appear here.' : 'Connecting to the server…'}</p>
+          <p>
+            {!live
+              ? 'Connecting to the server…'
+              : appFilter === 'all'
+                ? 'Start a Claude Code or Codex session and it will appear here.'
+                : `Start a ${APP_LABEL[appFilter]} session and it will appear here.`}
+          </p>
         </div>
       )}
 
-      <header className="topbar">
+      <header className={`topbar${showFilter ? ' has-filter' : ''}`}>
         <Icon.Logo />
         <h1>Agent Control</h1>
         <span className="divider" />
@@ -549,7 +661,15 @@ export default function App() {
         <span className="stat">
           {visible.length} {visible.length === 1 ? 'agent' : 'agents'}
         </span>
-        {attention > 0 && <span className="stat alert">{attention} needs approval</span>}
+        {attention > 0 && (
+          <button
+            className="stat alert"
+            title="Show the first agent that needs approval"
+            onClick={() => setSelected(approvals.find((a) => byId.has(a.agentId))?.agentId ?? visible.find((a) => a.attention)?.id ?? null)}
+          >
+            {attention} needs approval
+          </button>
+        )}
         {tokens > 0 && (
           <span className="stat" title={TOKENS_NOTE}>
             {fmtTokens(newTokens(totals.tokens))} new / {fmtTokens(tokens)} total tokens
@@ -563,6 +683,15 @@ export default function App() {
       </header>
 
       <div className="tools">
+        {showFilter && (
+          <span className="app-filter card" role="group" aria-label="Show sessions from">
+            {APP_FILTERS.map(([f, label, title]) => (
+              <button key={f} aria-pressed={appFilter === f} title={title} onClick={() => changeAppFilter(f)}>
+                {label}
+              </button>
+            ))}
+          </span>
+        )}
         {notificationsSupported() && !demo && (
           <button
             className={`tool${notifyOn ? ' active' : ''}`}
@@ -580,6 +709,8 @@ export default function App() {
             {notifyOn ? <Icon.Bell /> : <Icon.BellOff />}
           </button>
         )}
+        {layout === 'map' && (
+        <>
         <button
           className="tool"
           aria-label="Fit all agents"
@@ -599,9 +730,19 @@ export default function App() {
             <Icon.ZoomIn />
           </button>
         </span>
+        </>
+        )}
         <button className="tool" aria-label="Toggle fullscreen" title="Fullscreen" onClick={toggleFullscreen}>
           <Icon.Expand />
         </button>
+        <span className="app-filter layout-toggle card" role="group" aria-label="Layout">
+          <button aria-pressed={layout === 'map'} aria-label="Map view" title="Map view" onClick={() => changeLayout('map')}>
+            <Icon.Graph />
+          </button>
+          <button aria-pressed={layout === 'list'} aria-label="List view" title="List view" onClick={() => changeLayout('list')}>
+            <Icon.List />
+          </button>
+        </span>
       </div>
 
       <footer className="statusbar">
@@ -638,6 +779,7 @@ export default function App() {
           onShow={() => showOnStage([sel.id])}
           removedSubagents={removedUnder(sel).length}
           onShowSubagents={() => showOnStage(removedUnder(sel).map((a) => a.id))}
+          approvals={approvalCards([sel.id], false)}
         />
       )}
     </>

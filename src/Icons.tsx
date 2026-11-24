@@ -81,6 +81,11 @@ export const Check = () => (
     <path d="m6 12.5 4 4 8-9" />
   </Svg>
 )
+export const Code = () => (
+  <Svg>
+    <path d="M8 7 3 12l5 5M16 7l5 5-5 5" />
+  </Svg>
+)
 export const Layers = () => (
   <Svg>
     <path d="m12 3 9 5-9 5-9-5 9-5Z" />
@@ -125,5 +130,32 @@ export const Wrench = () => (
 export const Chat = () => (
   <Svg>
     <path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v7a2.5 2.5 0 0 1-2.5 2.5H10l-5 4v-4.2A2.5 2.5 0 0 1 4 13.5v-7Z" />
+  </Svg>
+)
+export const Graph = () => (
+  <Svg>
+    <circle cx="12" cy="6" r="2.6" />
+    <circle cx="5.5" cy="17.5" r="2.6" />
+    <circle cx="18.5" cy="17.5" r="2.6" />
+    <path d="m10.6 8.3-3.7 6.9M13.4 8.3l3.7 6.9" />
+  </Svg>
+)
+export const List = () => (
+  <Svg>
+    <path d="M9 6h11M9 12h11M9 18h11" />
+    <circle cx="4.5" cy="6" r="1" />
+    <circle cx="4.5" cy="12" r="1" />
+    <circle cx="4.5" cy="18" r="1" />
+  </Svg>
+)
+export const Chevron = () => (
+  <Svg>
+    <path d="m9 6 6 6-6 6" />
+  </Svg>
+)
+export const Shield = () => (
+  <Svg>
+    <path d="M12 3 5 6v5c0 4.5 3 8.3 7 10 4-1.7 7-5.5 7-10V6l-7-3Z" />
+    <path d="M12 8.5v4M12 15.5v.01" />
   </Svg>
 )

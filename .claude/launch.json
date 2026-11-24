@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "agent-control",
+      "runtimeExecutable": "/Users/ludwignord/.nvm/versions/node/v26.13.1/bin/node",
+      "runtimeArgs": [
+        "--env-file-if-exists=.env",
+        "server/index.js"
+      ],
+      "port": 3000
+    }
+  ]
+}

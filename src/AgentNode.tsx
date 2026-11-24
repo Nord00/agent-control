@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import type { CSSProperties } from 'react'
 import type { Agent } from './sim'
-import { RETIRE_MS, fmtCost, fmtTokens, modelName, newTokens, totalTokens } from './format'
+import { APP_LABEL, RETIRE_MS, appOf, fmtCost, fmtTokens, modelName, newTokens, totalTokens } from './format'
 import * as Icon from './Icons'
 
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
@@ -54,7 +54,9 @@ export default function AgentNode({ agent: a, from, selected, pinned, onSelect }
   } as CSSProperties
 
   const tokens = totalTokens(a.tokens)
+  const app = appOf(a)
   const caption = [
+    app ? APP_LABEL[app] : null,
     a.model ? modelName(a.model) : null,
     tokens ? `${fmtTokens(newTokens(a.tokens))} new / ${fmtTokens(tokens)} total` : null,
     typeof a.cost === 'number' ? fmtCost(a.cost, a.costPartial) : null,
