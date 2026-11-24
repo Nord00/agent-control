@@ -803,6 +803,10 @@ button.stat:hover { text-decoration: underline; }
 .rv-form .rv-path { margin-top: -10px; font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
 .rv-row > :first-child { flex: 1; min-width: 0; }
 .rv-row .panel-button { padding: 0 14px; flex: none; }
+.rv-remote { display: grid; gap: 6px; margin-top: -6px; }
+.rv-remote .hint { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.rv-warn { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 13px; color: var(--waiting); }
+.rv-warn .link-button { color: var(--waiting); text-decoration: underline; text-underline-offset: 2px; }
 .rv-two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .rv-form select, .rv-form input, .rv-form textarea {
   width: 100%;

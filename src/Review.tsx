@@ -156,10 +156,44 @@ interface Repo {
   name: string
   source: 'added' | 'session' // session: a repo your Claude Code or Codex sessions ran in
 }
+interface Branch {
+  name: string
+  at: number
+  remote?: string | true // true: a remote branch; a name: the local branch's remote, when they differ
+  ahead?: number
+  behind?: number
+}
 interface Branches {
-  branches: { name: string; at: number }[]
+  branches: Branch[]
   base: string
   current: string
+  hasRemote: boolean
+  fetchedAt?: number
+  fetchError?: string
+}
+
+const branchLabel = (b: Branch) => {
+  if (typeof b.remote !== 'string') return b.name
+  const parts = [b.behind ? `${b.behind} behind` : '', b.ahead ? `${b.ahead} ahead` : ''].filter(Boolean)
+  return `${b.name}  (${parts.join(', ')} ${b.remote})`
+}
+
+function BranchOptions({ branches }: { branches: Branch[] }) {
+  const local = branches.filter((b) => b.remote !== true)
+  const remote = branches.filter((b) => b.remote === true)
+  const opts = (list: Branch[]) =>
+    list.map((b) => (
+      <option key={b.name} value={b.name}>
+        {branchLabel(b)}
+      </option>
+    ))
+  if (!remote.length) return <>{opts(local)}</>
+  return (
+    <>
+      <optgroup label="Local">{opts(local)}</optgroup>
+      <optgroup label="Remote">{opts(remote)}</optgroup>
+    </>
+  )
 }
 
 const readPref = (k: string) => {
@@ -211,13 +245,42 @@ function NewReview({ api, onStarted }: { api: Api; onStarted: (id: string) => vo
     writePref('ac.reviewRepo', repo)
     setInfo(null)
     setError('')
-    api<Branches>(`/api/review/branches?repo=${encodeURIComponent(repo)}`).then((b) => {
-      setInfo(b)
-      setBase(b.base)
-      // The branch you're on, unless that's the base: then the most recently changed one.
-      setBranch(b.current && b.current !== b.base ? b.current : (b.branches.find((x) => x.name !== b.base)?.name ?? ''))
-    }, (e) => setError(e.message))
+    let stale = false
+    // What's there now at once, then again after fetching the remotes.
+    void loadBranches(false, () => stale).then(() => {
+      if (!stale) void loadBranches(true, () => stale)
+    })
+    return () => {
+      stale = true
+    }
   }, [repo]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const [fetching, setFetching] = useState(false)
+  const [baseTouched, setBaseTouched] = useState(false)
+  const loadBranches = async (fetch: boolean | 'force', isStale: () => boolean = () => false) => {
+    if (fetch) setFetching(true)
+    try {
+      const q = fetch ? `&fetch=${fetch === 'force' ? 'force' : '1'}` : ''
+      const b = await api<Branches>(`/api/review/branches?repo=${encodeURIComponent(repo)}${q}`)
+      if (isStale()) return
+      const has = (n: string) => b.branches.some((x) => x.name === n)
+      setInfo(b)
+      // Keep what you picked if it still exists; otherwise the defaults.
+      setBase((cur) => (baseTouched && has(cur) ? cur : b.base))
+      setBranch((cur) =>
+        cur && has(cur) && cur !== b.base
+          ? cur
+          : // The branch you're on, unless that's the base: then the most recently changed one.
+            b.current && b.current !== b.base && has(b.current)
+            ? b.current
+            : (b.branches.find((x) => x.name !== b.base && x.name !== b.base.replace(/^[^/]+\//, ''))?.name ?? ''),
+      )
+    } catch (e) {
+      if (!isStale()) setError((e as Error).message)
+    } finally {
+      if (fetch && !isStale()) setFetching(false)
+    }
+  }
 
   const addRepo = async () => {
     setError('')
@@ -323,24 +386,55 @@ function NewReview({ api, onStarted }: { api: Api; onStarted: (id: string) => vo
         <label className="rv-field">
           <span>Branch to review</span>
           <select value={branch} onChange={(e) => setBranch(e.target.value)} disabled={!info}>
-            {names.map((n) => (
-              <option key={n} value={n}>
-                {n}
-              </option>
-            ))}
+            <BranchOptions branches={info?.branches ?? []} />
           </select>
         </label>
         <label className="rv-field">
           <span>Compared with</span>
-          <select value={base} onChange={(e) => setBase(e.target.value)} disabled={!info}>
-            {names.map((n) => (
-              <option key={n} value={n}>
-                {n}
-              </option>
-            ))}
+          <select
+            value={base}
+            onChange={(e) => {
+              setBase(e.target.value)
+              setBaseTouched(true)
+            }}
+            disabled={!info}
+          >
+            <BranchOptions branches={info?.branches ?? []} />
           </select>
         </label>
       </div>
+      {(() => {
+        const picked = info?.branches.find((b) => b.name === branch)
+        const old = picked && typeof picked.remote === 'string' && picked.behind
+        return (
+          <div className="rv-remote">
+            {old ? (
+              <span className="rv-warn">
+                Your local {picked.name} is {picked.behind} commit{picked.behind === 1 ? '' : 's'} behind {picked.remote as string}.{' '}
+                <button type="button" className="link-button" onClick={() => setBranch(picked.remote as string)}>
+                  Review {picked.remote as string} instead
+                </button>
+              </span>
+            ) : null}
+            {info?.hasRemote && (
+              <span className="hint">
+                {fetching
+                  ? 'Fetching from the remote…'
+                  : info.fetchError
+                    ? `Could not fetch (${info.fetchError}), showing what was fetched last.`
+                    : info.fetchedAt
+                      ? `Remote branches fetched ${fmtAgo(Date.now() - info.fetchedAt)}.`
+                      : ''}
+                {!fetching && (
+                  <button type="button" className="link-button" onClick={() => loadBranches('force')}>
+                    Fetch now
+                  </button>
+                )}
+              </span>
+            )}
+          </div>
+        )
+      })()}
 
       <label className="rv-field">
         <span>

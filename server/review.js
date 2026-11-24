@@ -63,10 +63,19 @@ const SCHEMA = {
 
 const text = (v, n) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, n) : undefined)
 
-function git(cwd, args, maxBuffer = 20 * 1024 * 1024) {
+// Never wait for a password or a host-key prompt: nobody would see it.
+const GIT_ENV = {
+  ...process.env,
+  GIT_TERMINAL_PROMPT: '0',
+  GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND || 'ssh -o BatchMode=yes',
+}
+const FETCH_TIMEOUT_MS = 20_000
+const FETCH_EVERY_MS = 30_000 // picking the same repo again within this reuses the last fetch
+
+function git(cwd, args, maxBuffer = 20 * 1024 * 1024, timeout = 0) {
   return new Promise((resolve, reject) => {
-    execFile('git', ['-C', cwd, ...args], { maxBuffer, encoding: 'utf8' }, (err, stdout, stderr) => {
-      if (err) reject(new Error((stderr || err.message).trim().split('\n')[0].slice(0, 300)))
+    execFile('git', ['-C', cwd, ...args], { maxBuffer, encoding: 'utf8', env: GIT_ENV, timeout }, (err, stdout, stderr) => {
+      if (err) reject(new Error(err.killed ? 'timed out' : (stderr || err.message).trim().split('\n')[0].slice(0, 300)))
       else resolve(stdout)
     })
   })
@@ -250,26 +259,90 @@ export function createReviews({ dataDir, broadcast }) {
     ...store.seen.filter((r) => !store.repos.includes(r)).map((r) => ({ path: r, name: path.basename(r), source: 'session' })),
   ]
 
-  async function branches(repo) {
+  // Fetches every remote so remote branches are current. Failing is fine (offline, no access):
+  // the list is then what was fetched last, and the reason is shown.
+  const fetched = new Map() // repo -> {at, error}
+  async function fetchRepo(repo, force) {
+    const last = fetched.get(repo)
+    if (last && !force && Date.now() - last.at < FETCH_EVERY_MS) return last
+    const remotes = (await git(repo, ['remote']).catch(() => '')).trim()
+    if (!remotes) return { at: Date.now(), none: true }
+    const r = await git(repo, ['fetch', '--all', '--prune', '--quiet'], undefined, FETCH_TIMEOUT_MS).then(
+      () => ({ at: Date.now() }),
+      (e) => ({ at: Date.now(), error: e.message }),
+    )
+    fetched.set(repo, r)
+    return r
+  }
+
+  async function branches(repo, { fetch = false, force = false } = {}) {
     if (!known(repo)) throw new Error('Unknown repository')
-    const out = await git(repo, ['for-each-ref', '--sort=-committerdate', '--format=%(refname:short)\t%(committerdate:unix)', 'refs/heads', 'refs/remotes'])
-    const all = out
+    const f = fetch ? await fetchRepo(repo, force) : fetched.get(repo)
+    const remotes = (await git(repo, ['remote']).catch(() => '')).split('\n').filter(Boolean)
+    const out = await git(repo, ['for-each-ref', '--sort=-committerdate', '--format=%(refname)\t%(objectname)\t%(committerdate:unix)', 'refs/heads', 'refs/remotes'])
+    const refs = out
       .split('\n')
       .filter(Boolean)
       .map((l) => {
-        const [name, at] = l.split('\t')
-        return { name, at: Number(at) * 1000 }
+        const [ref, sha, at] = l.split('\t')
+        const remote = ref.startsWith('refs/remotes/')
+        const name = ref.replace(/^refs\/(heads|remotes)\//, '')
+        return { name, sha, at: Number(at) * 1000, remote }
       })
-      .filter((b) => b.name !== 'origin' && !b.name.endsWith('/HEAD'))
-    // origin/x is left out when there is a local x.
-    const localNames = new Set(all.filter((b) => !b.name.startsWith('origin/')).map((b) => b.name))
-    const list = all.filter((b) => !(b.name.startsWith('origin/') && localNames.has(b.name.slice(7))))
+      .filter((b) => !(b.remote && (b.name.endsWith('/HEAD') || remotes.includes(b.name))))
+    const bySha = new Map(refs.map((b) => [b.name, b.sha]))
+    // The remote a local branch is compared with: its upstream, else the same name on origin.
+    const upstreams = new Map(
+      (await git(repo, ['for-each-ref', '--format=%(refname:short)\t%(upstream:short)', 'refs/heads']).catch(() => ''))
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => l.split('\t'))
+        .filter(([, u]) => u),
+    )
+    const pairOf = (local) => {
+      const u = upstreams.get(local)
+      if (u && bySha.has(u)) return u
+      const same = remotes.map((r) => `${r}/${local}`).find((n) => bySha.has(n))
+      return same
+    }
+    const hidden = new Set() // remote branches identical to their local one
+    const list = []
+    for (const b of refs) {
+      if (b.remote) continue
+      const remote = pairOf(b.name)
+      const entry = { name: b.name, at: b.at }
+      if (remote) {
+        if (bySha.get(remote) === b.sha) hidden.add(remote)
+        else {
+          const [ahead, behind] = (await git(repo, ['rev-list', '--left-right', '--count', `${b.sha}...${bySha.get(remote)}`]).catch(() => '0 0'))
+            .trim()
+            .split(/\s+/)
+            .map(Number)
+          Object.assign(entry, { remote, ahead, behind })
+        }
+      }
+      list.push(entry)
+    }
+    for (const b of refs) if (b.remote && !hidden.has(b.name)) list.push({ name: b.name, at: b.at, remote: true })
+    list.sort((a, b) => b.at - a.at)
     const names = new Set(list.map((b) => b.name))
-    let base = (await git(repo, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).catch(() => '')).trim()
-    if (names.has(base.replace(/^origin\//, ''))) base = base.replace(/^origin\//, '')
-    if (!names.has(base)) base = ['main', 'master', 'develop', 'trunk'].find((n) => names.has(n)) ?? list[0]?.name ?? ''
+
+    // Base: the remote's default branch, as the local copy unless that is behind the remote.
+    const head = (await git(repo, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']).catch(() => '')).trim() // origin/main
+    const candidates = [head.replace(/^origin\//, ''), 'main', 'master', 'develop', 'trunk'].filter(Boolean)
+    let base = candidates.find((n) => names.has(n) || names.has(`origin/${n}`) || hidden.has(`origin/${n}`)) ?? list[0]?.name ?? ''
+    const local = list.find((b) => b.name === base)
+    if (!local && names.has(`origin/${base}`)) base = `origin/${base}`
+    else if (local?.behind) base = local.remote
     const current = (await git(repo, ['branch', '--show-current']).catch(() => '')).trim()
-    return { branches: list, base, current }
+    return {
+      branches: list,
+      base,
+      current,
+      fetchedAt: f && !f.none ? f.at : undefined,
+      fetchError: f?.error,
+      hasRemote: remotes.length > 0,
+    }
   }
 
   async function start(body) {
@@ -453,7 +526,8 @@ export function createReviews({ dataDir, broadcast }) {
       return true
     }
     if (p === '/api/review/branches' && req.method === 'GET') {
-      branches(url.searchParams.get('repo') ?? '').then((b) => json(200, b), fail)
+      const fetch = url.searchParams.get('fetch') // 1 = fetch if not done lately, force = fetch now
+      branches(url.searchParams.get('repo') ?? '', { fetch: !!fetch, force: fetch === 'force' }).then((b) => json(200, b), fail)
       return true
     }
     if (p === '/api/reviews' && req.method === 'GET') return json(200, publicList()), true

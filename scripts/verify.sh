@@ -301,6 +301,33 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$base/api/reviews/$fid"
 gone=$(curl -s -o /dev/null -w '%{http_code}' "$base/api/reviews/$fid" -H "$auth")
 [ "$code" = 200 ] && [ "$gone" = 404 ] && ok "Deleting a review removes it" || bad "delete review: $code, then $gone"
 
+# A clone whose remote has moved on: its local main and feature are behind origin.
+CLONE=$REVIEW_TMP/clone
+git clone -q "$REPO" "$CLONE"
+git -C "$CLONE" checkout -q -b feature origin/feature
+git -C "$CLONE" checkout -q main
+g commit -q --allow-empty -m "main moves on"
+g checkout -q feature && g commit -q --allow-empty -m "feature moves on" && g checkout -q main
+g checkout -qb pushed-later && g commit -q --allow-empty -m "new branch" && g checkout -q main
+CLONE_TOP=$(rpost /api/review/repos "{\"path\":\"$CLONE\"}" | jget v.added)
+bl() { curl -s -G "$base/api/review/branches" --data-urlencode "repo=$CLONE_TOP" ${1:+--data-urlencode "fetch=$1"} -H "$auth"; }
+got=$(bl | jget '[v.base, v.branches.some(b=>b.name==="origin/pushed-later")].join()')
+[ "$got" = "main,false" ] && ok "Without a fetch, branches are what was fetched last" || bad "before fetch: '$got' (want main,false)"
+bj=$(bl 1)
+got=$(echo "$bj" | jget '[!v.fetchError, v.branches.some(b=>b.name==="origin/pushed-later"&&b.remote===true)].join()')
+[ "$got" = "true,true" ] && ok "Choosing a repo fetches its remote: new remote branches show up" || bad "after fetch: '$got' ($(echo "$bj" | jget v.fetchError))"
+got=$(echo "$bj" | jget 'JSON.stringify(v.branches.filter(b=>b.name==="feature"||b.name==="origin/feature").map(b=>[b.name,b.remote,b.behind]).sort())')
+[ "$got" = '[["feature","origin/feature",1],["origin/feature",true,null]]' ] \
+  && ok "A local branch behind its remote shows how far, next to the remote one" || bad "feature vs origin/feature: $got"
+got=$(echo "$bj" | jget 'v.base')
+[ "$got" = origin/main ] && ok "Base is origin/main when the local main is behind it" || bad "base with stale main: '$got' (want origin/main)"
+rid=$(rpost /api/reviews "{\"repo\":\"$CLONE_TOP\",\"branch\":\"origin/feature\",\"base\":\"origin/main\"}" | jget v.id)
+st=$(rwait "$rid")
+[ "$st" = done ] && ok "A remote branch can be reviewed without checking it out" || bad "remote branch review: '$st'"
+git -C "$CLONE" remote set-url origin "$REVIEW_TMP/no-such-remote"
+got=$(bl force | jget '[!!v.fetchError, v.branches.some(b=>b.name==="origin/pushed-later")].join()')
+[ "$got" = "true,true" ] && ok "A failed fetch is reported and the last fetched branches stay" || bad "failed fetch: '$got' (want true,true)"
+
 step "Startup cleanup of saved helper subagents"
 GDIR=$(mktemp -d)
 NOW=$(node -e 'console.log(Date.now())')
