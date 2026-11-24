@@ -150,6 +150,13 @@ ids=$(curl -s "$base/api/agents" -H "$auth" | jget 'v.map(a=>a.id).join(" ")')
 case " $ids " in *" verify-codex-real "*) ok "Codex session shows up" ;; *) bad "Codex session missing: $ids" ;; esac
 case " $ids " in *" verify-codex-fork "*) bad "Codex helper session (no transcript) was shown" ;; *) ok "Codex helper session without transcript is ignored" ;; esac
 
+curl -s -o /dev/null -X POST "$base/events" -H "$auth" -d '{"app":"claude","session_id":"verify-sub","hook_event_name":"SessionStart","cwd":"/tmp/x"}'
+curl -s -o /dev/null -X POST "$base/events" -H "$auth" -d '{"app":"claude","session_id":"verify-sub","hook_event_name":"SubagentStart","agent_id":"verify-sub-real","agent_type":"Explore"}'
+curl -s -o /dev/null -X POST "$base/events" -H "$auth" -d '{"app":"claude","session_id":"verify-sub","hook_event_name":"SubagentStop","agent_id":"verify-sub-real","agent_type":"Explore"}'
+curl -s -o /dev/null -X POST "$base/events" -H "$auth" -d '{"app":"claude","session_id":"verify-sub","hook_event_name":"SubagentStop","agent_id":"verify-sub-ghost"}'
+subs=$(curl -s "$base/api/agents" -H "$auth" | jget 'v.filter(a=>a.parentId==="verify-sub").map(a=>a.id+":"+a.status).join()')
+[ "$subs" = "verify-sub-real:completed" ] && ok "SubagentStop without a start (internal helper) is ignored" || bad "subagents of verify-sub: '$subs' (want verify-sub-real:completed)"
+
 # A question answered from the dashboard comes back as allow + the input with answers.
 OUT=$(mktemp)
 printf '%s' '{"session_id":"verify-hq","hook_event_name":"PermissionRequest","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Pick one?","header":"Pick","options":[{"label":"A"},{"label":"B"}],"multiSelect":false}]}}' \
@@ -180,6 +187,26 @@ curl -s -o /dev/null -X POST "$base/api/approvals/$hc" -H "$auth" -d '{"decision
 wait $HPID
 got=$(jget 'JSON.stringify(v.hookSpecificOutput.decision)' <"$OUT")
 [ "$got" = '{"behavior":"allow"}' ] && ok "Codex gets a bare allow (no updatedInput)" || bad "codex allow output: '$got'"
+
+step "Startup cleanup of saved helper subagents"
+GDIR=$(mktemp -d)
+NOW=$(node -e 'console.log(Date.now())')
+cat >"$GDIR/agents.json" <<JSON
+[
+ {"id":"g-root","parentId":null,"name":"root","task":"","status":"working","startedAt":$NOW,"lastEventAt":$NOW},
+ {"id":"g-ghost","parentId":"g-root","name":"subagent","task":"Subagent finished","status":"completed","startedAt":$NOW,"endedAt":$((NOW+40)),"lastEventAt":$((NOW+40))},
+ {"id":"g-typed","parentId":"g-root","name":"Explore","task":"Subagent finished","status":"completed","startedAt":$NOW,"endedAt":$((NOW+40)),"lastEventAt":$((NOW+40))},
+ {"id":"g-worked","parentId":"g-root","name":"subagent","task":"Subagent finished","status":"completed","requests":3,"startedAt":$NOW,"endedAt":$((NOW+40)),"lastEventAt":$((NOW+40))},
+ {"id":"g-long","parentId":"g-root","name":"subagent","task":"Subagent finished","status":"completed","startedAt":$NOW,"endedAt":$((NOW+60000)),"lastEventAt":$((NOW+60000))}
+]
+JSON
+GPORT=$((PORT + 1))
+PORT=$GPORT AGENT_CONTROL_TOKEN=$TOKEN AGENT_CONTROL_DATA=$GDIR/agents.json node server/index.js >/tmp/verify-server2.log 2>&1 &
+GPID=$!
+for _ in $(seq 1 30); do curl -s -o /dev/null "http://localhost:$GPORT/health" && break; sleep 0.2; done
+kept=$(curl -s "http://localhost:$GPORT/api/agents" -H "$auth" | jget 'v.map(a=>a.id).sort().join()')
+kill $GPID 2>/dev/null
+[ "$kept" = "g-long,g-root,g-typed,g-worked" ] && ok "Saved helper subagents are removed at startup, real ones kept" || bad "after startup cleanup: '$kept' (want g-long,g-root,g-typed,g-worked)"
 
 if [ $fail -ne 0 ]; then echo; echo "Server log:"; tail -20 /tmp/verify-server.log; fi
 

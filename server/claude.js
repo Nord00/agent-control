@@ -133,6 +133,9 @@ export function mapHook(p, agents) {
       break
     case 'SubagentStop':
       if (!aid) return null
+      // Claude Code also runs short internal helpers that report only their stop, with no
+      // SubagentStart and no transcript. A real subagent was seen starting; skip the rest.
+      if (!agents.has(aid)) break
       ensureSub()
       out.push({ id: aid, status: 'completed', task: 'Subagent finished' })
       // The session's turn already ended and was waiting on subagents: it completes

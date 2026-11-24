@@ -74,6 +74,26 @@ function load() {
     }
     agents.set(a.id, a)
   }
+  // Saved before the server ignored them: Claude Code's internal helpers, which only report a
+  // stop. They have no type of their own (so the default name), never called the model or a
+  // tool, and were over within seconds. A real subagent always has at least one of those.
+  let ghosts = 0
+  for (const a of [...agents.values()]) {
+    const ghost =
+      a.parentId &&
+      a.name === 'subagent' &&
+      a.status === 'completed' &&
+      !(a.requests > 0) &&
+      !(a.toolCalls > 0) &&
+      typeof a.endedAt === 'number' &&
+      a.endedAt - a.startedAt <= 3000 &&
+      ![...agents.values()].some((c) => c.parentId === a.id)
+    if (ghost) agents.delete(a.id), ghosts++
+  }
+  if (ghosts) {
+    console.log(`Removed ${ghosts} internal helper${ghosts === 1 ? '' : 's'} saved as subagents`)
+    scheduleSave()
+  }
   // Its settle timer didn't survive the restart.
   for (const a of agents.values()) {
     if (!a.turnEnded || hasActiveSubagents(a.id)) continue
