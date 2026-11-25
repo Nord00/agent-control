@@ -29,6 +29,68 @@ const EFFORTS = ['', 'low', 'medium', 'high', 'xhigh']
 const ALLOWED_TOOLS = ['Read', 'Grep', 'Glob', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(git blame:*)']
 const DISALLOWED_TOOLS = ['Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch']
 
+// The fix agent edits files in your working copy, and nothing else: no Bash means no git, so it
+// can't commit, push or switch branches whatever it decides. It can't write in .git or .claude
+// either: git config, git hooks and Claude Code hooks there would let it run commands. Edits are
+// limited to the repository (./** is relative to its cwd), so ~/.claude, ~/.gitconfig and shell rc
+// files are out of reach too, and the real git dir (outside the repo in a linked worktree) is denied.
+const FIX_ALLOWED_TOOLS = ['Read', 'Grep', 'Glob', 'Edit(./**)', 'Write(./**)']
+const FIX_PROTECTED = ['.git/**', '.claude/**', '**/.git/**', '**/.claude/**', '~/.claude/**', '~/.gitconfig', '~/.config/git/**']
+const fixDisallowedTools = (gitDir) =>
+  ['Bash', 'NotebookEdit', 'WebFetch', 'WebSearch', ...[...FIX_PROTECTED, ...(gitDir ? [`/${gitDir}/**`] : [])].flatMap((p) => [`Edit(${p})`, `Write(${p})`])]
+const MAX_FIX_PATCH = 2_000_000 // bigger fixes still show, but can't be undone from here
+
+const FIX_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string', description: 'One to three sentences: what you changed.' },
+    results: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'The finding id, e.g. f1.' },
+          outcome: { type: 'string', enum: ['fixed', 'skipped'] },
+          note: { type: 'string', description: 'How you fixed it, or why you skipped it.' },
+        },
+        required: ['id', 'outcome', 'note'],
+      },
+    },
+  },
+  required: ['summary', 'results'],
+}
+
+function buildFixPrompt(r, findings) {
+  const list = findings
+    .map((f) =>
+      [
+        `### ${f.id}: ${f.title}`,
+        `- Where: ${f.file ?? 'not tied to a file'}${f.line ? `:${f.line}` : ''}`,
+        `- Severity: ${f.severity} (${f.category})`,
+        f.detail && `- Problem: ${f.detail}`,
+        f.scenario && `- Fails when: ${f.scenario}`,
+        f.suggestion && `- Suggested fix: ${f.suggestion}`,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    )
+    .join('\n\n')
+  return `You are fixing review findings in this repository, on the branch that is checked out (\`${r.branch}\`).
+A reviewer found these problems and the user accepted them. The code may have changed a little since the review,
+so read the current code before you change it.
+
+## Findings to fix
+${list}
+
+## How to work
+- Fix each finding with the smallest change that solves it. Don't refactor, reformat or change anything else.
+- The working copy may hold other uncommitted work. Leave it as it is.
+- If a finding is wrong, already fixed, or can't be fixed safely, skip it and say why.
+- You can only read and edit files. Don't try to run commands, commit or switch branches.
+- In "results", give every finding id above with "fixed" or "skipped" and a short note.
+- Write in the language the findings are written in.`
+}
+
 const SCHEMA = {
   type: 'object',
   properties: {
@@ -86,6 +148,21 @@ function git(cwd, args, maxBuffer = 20 * 1024 * 1024, timeout = 0, env = {}) {
   })
 }
 
+// git with input on stdin (git apply).
+function gitInput(cwd, args, input) {
+  return new Promise((resolve, reject) => {
+    const child = execFile('git', ['-C', cwd, ...args], { encoding: 'utf8', env: GIT_ENV }, (err, stdout, stderr) => {
+      if (err) reject(new Error((stderr || err.message).trim().split('\n').slice(0, 3).join(' ').slice(0, 400)))
+      else resolve(stdout)
+    })
+    child.stdin.on('error', () => {})
+    child.stdin.end(input)
+  })
+}
+
+// The findings a fix fixed, with its note: { [id]: { outcome: 'fixed', note } }.
+const fixedOf = (fix) => Object.fromEntries(Object.entries(fix.results ?? {}).filter(([, x]) => x.outcome === 'fixed'))
+
 // A ref the user picked: never something git would read as an option.
 const refOk = (r) => typeof r === 'string' && r.length > 0 && r.length <= 200 && !r.startsWith('-') && !/[\s\0~^:?*[\\]/.test(r)
 
@@ -102,7 +179,9 @@ async function snapshot(repo) {
     const env = { GIT_INDEX_FILE: index }
     if (fs.existsSync(real)) fs.copyFileSync(real, index)
     else await git(repo, ['read-tree', head], undefined, 0, env) // nothing ever staged
-    await git(repo, ['add', '-A', '--', '.'], undefined, 60_000, env)
+    // No fsmonitor or hooks: this also runs right after a fix agent, and a command it planted in
+    // .git/config must not run as you.
+    await git(repo, ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', 'add', '-A', '--', '.'], undefined, 60_000, env)
     const tree = (await git(repo, ['write-tree'], undefined, 0, env)).trim()
     if (tree === (await git(repo, ['rev-parse', `${head}^{tree}`])).trim()) return { sha: head, dirty: false }
     const who = { GIT_AUTHOR_NAME: 'Agent Control', GIT_AUTHOR_EMAIL: 'agent-control@localhost', GIT_COMMITTER_NAME: 'Agent Control', GIT_COMMITTER_EMAIL: 'agent-control@localhost' }
@@ -188,7 +267,7 @@ function cleanFindings(out, worktree) {
     .map((f, i) => ({ id: `f${i + 1}`, ...f }))
 }
 
-export function createReviews({ dataDir, broadcast }) {
+export function createReviews({ dataDir, broadcast, agents = () => [] }) {
   const FILE = path.join(dataDir, 'reviews.json')
   /** @type {{repos: string[], reviews: object[]}} */
   // repos: added by hand. seen: repos that sessions ran in (from the hooks' cwd), newest first.
@@ -217,6 +296,16 @@ export function createReviews({ dataDir, broadcast }) {
     if (r.worktree) removeWorktree(r)
   }
   if (orphans.length) save()
+  // A fix whose process didn't survive the restart: its edits may be half done, so show what changed.
+  const orphanFixes = store.reviews.filter((r) => r.fix?.status === 'running')
+  for (const r of orphanFixes) Object.assign(r.fix, { status: 'failed', error: 'The server restarted during the fix', endedAt: Date.now() })
+  if (orphanFixes.length) {
+    save()
+    setTimeout(() => orphanFixes.forEach((r) => recordFixDiff(r).then(changed)), 0)
+  }
+  // Reviews saved before r.fixed existed: what their last fix fixed.
+  for (const r of store.reviews)
+    if (!r.fixed && r.fix?.results && r.fix.status !== 'undone') r.fixed = fixedOf(r.fix)
 
   function save() {
     try {
@@ -241,6 +330,7 @@ export function createReviews({ dataDir, broadcast }) {
       createdAt: r.createdAt,
       endedAt: r.endedAt,
       agentId: r.sessionId,
+      fix: r.fix ? { status: r.fix.status, agentId: r.fix.sessionId } : undefined,
       verdict: r.verdict,
       counts: Object.fromEntries(SEVERITIES.map((s) => [s, open.filter((f) => f.severity === s).length])),
       total: r.findings?.length ?? 0,
@@ -571,11 +661,216 @@ export function createReviews({ dataDir, broadcast }) {
     }
   }
 
+  // --- Fix: an agent that fixes the accepted findings in your working copy ---
+  const fixProcs = new Map() // review id -> child process
+  const fixBusy = new Set() // repos where a fix is starting or stopping (between awaits, before r.fix shows it)
+
+  // Sessions working in this repo right now (not our own reviews and fixes): they could edit the
+  // same files as the fix.
+  const ownSessions = () => new Set(store.reviews.flatMap((r) => [r.sessionId, r.fix?.sessionId]).filter(Boolean))
+  const busyIn = (repo) => {
+    const own = ownSessions()
+    return agents().filter((a) => !a.parentId && a.status === 'working' && !own.has(a.id) && sessions.get(a.id) === repo)
+  }
+
+  async function startFix(r, body) {
+    if (r.status !== 'done') throw new Error('Only a finished review can be fixed')
+    if (r.fix?.status === 'running') throw new Error('A fix is already running for this review')
+    if (fixBusy.has(r.repo) || store.reviews.some((x) => x.repo === r.repo && x.fix?.status === 'running'))
+      throw new Error('A fix is already running in this repository')
+    // Findings an earlier fix already fixed aren't sent again (unless that fix was undone).
+    const fixedBefore = new Set(Object.keys(r.fixed ?? {}))
+    const accepted = (r.findings ?? []).filter((f) => f.status === 'accepted' && !fixedBefore.has(f.id))
+    if (!accepted.length)
+      throw new Error(fixedBefore.size ? 'The accepted findings are already fixed' : 'Accept the findings you want fixed first')
+    const model = body?.model ?? ''
+    const effort = body?.effort ?? ''
+    if (!MODELS.includes(model)) throw new Error(`Unknown model: ${String(model).slice(0, 40)}`)
+    if (!EFFORTS.includes(effort)) throw new Error(`Unknown effort: ${String(effort).slice(0, 20)}`)
+    // Claimed before the first await, so a second request meanwhile is turned away.
+    fixBusy.add(r.repo)
+    let current, before, gitDir
+    try {
+      // Only on the branch that was reviewed, as it is checked out now: the fix never switches branches.
+      current = (await git(r.repo, ['branch', '--show-current']).catch(() => '')).trim()
+      if (current !== r.branch)
+        throw new Error(
+          `${r.branch} isn't checked out${current ? ` (you're on ${current})` : ''}. Check it out to fix it here: the fix never switches branches.`,
+        )
+      const busy = busyIn(r.repo)
+      if (busy.length && body?.force !== true) {
+        const e = new Error(`${busy.map((a) => a.name).join(', ')} ${busy.length === 1 ? 'is' : 'are'} working in this repository right now`)
+        e.busy = busy.map((a) => ({ id: a.id, name: a.name }))
+        throw e
+      }
+      // The shared git dir (config, hooks), as an absolute path: in a linked worktree it's outside the repo.
+      gitDir = path.resolve(r.repo, (await git(r.repo, ['rev-parse', '--git-common-dir'])).trim())
+      before = await snapshot(r.repo)
+    } finally {
+      fixBusy.delete(r.repo)
+    }
+    // Deleted while we were waiting on git: nothing would show or stop this fix.
+    if (!store.reviews.includes(r)) throw new Error('The review was deleted')
+    r.fix = {
+      status: 'running',
+      branch: current,
+      findingIds: accepted.map((f) => f.id),
+      sessionId: crypto.randomUUID(),
+      model: model || undefined,
+      effort: effort || undefined,
+      before: before.sha,
+      startedAt: Date.now(),
+    }
+    changed()
+    runFix(r, accepted, gitDir)
+    return r
+  }
+
+  function runFix(r, findings, gitDir) {
+    const fix = r.fix
+    const args = [
+      '-p',
+      '--output-format', 'json',
+      '--json-schema', JSON.stringify(FIX_SCHEMA),
+      '--session-id', fix.sessionId,
+      '--name', `Fix: ${r.branch}`.slice(0, 40),
+      ...(fix.model ? ['--model', fix.model] : []),
+      ...(fix.effort ? ['--effort', fix.effort] : []),
+      '--permission-mode', 'dontAsk',
+      '--allowedTools', ...FIX_ALLOWED_TOOLS,
+      '--disallowedTools', ...fixDisallowedTools(gitDir),
+    ]
+    const done = async (change) => {
+      if (fixProcs.get(r.id) === child) fixProcs.delete(r.id) // only our own child, not a later fix's
+      if (r.fix !== fix || fix.status !== 'running') return // stopped meanwhile: that already recorded it
+      Object.assign(fix, change, { endedAt: Date.now() })
+      // Kept on the review, so a later fix (or a failed one) doesn't forget what this one fixed.
+      r.fixed = { ...r.fixed, ...fixedOf(fix) }
+      await recordFixDiff(r)
+      changed()
+    }
+    let child
+    try {
+      child = spawn(CLAUDE, args, { cwd: r.repo, stdio: ['pipe', 'pipe', 'pipe'], env: process.env })
+    } catch (e) {
+      return void done({ status: 'failed', error: `Could not start ${CLAUDE}: ${e.message}` })
+    }
+    fixProcs.set(r.id, child)
+    let out = ''
+    let err = ''
+    child.stdout.on('data', (c) => (out = (out + c).slice(-5_000_000)))
+    child.stderr.on('data', (c) => (err = (err + c).slice(-4000)))
+    child.stdin.on('error', () => {})
+    child.stdin.end(buildFixPrompt(r, findings))
+    const timer = setTimeout(() => child.kill('SIGTERM'), TIMEOUT_MS).unref()
+    child.on('error', (e) => {
+      clearTimeout(timer)
+      done({ status: 'failed', error: e.code === 'ENOENT' ? `Could not find "${CLAUDE}"` : `Could not start ${CLAUDE}: ${e.message}` })
+    })
+    child.on('close', (code, signal) => {
+      clearTimeout(timer)
+      if (fixProcs.get(r.id) !== child) return
+      let res
+      try {
+        res = JSON.parse(out)
+      } catch {}
+      const so = res?.structured_output
+      const cost = typeof res?.total_cost_usd === 'number' ? res.total_cost_usd : undefined
+      if (!so || res.is_error) {
+        const why = signal
+          ? `Stopped after ${Math.round(TIMEOUT_MS / 60000)} minutes`
+          : text(res?.result, 600) ?? text(err, 1500) ?? `claude exited with code ${code}`
+        return void done({ status: 'failed', error: why, cost })
+      }
+      const ids = new Set(fix.findingIds)
+      const results = {}
+      for (const x of Array.isArray(so.results) ? so.results.slice(0, 60) : [])
+        if (ids.has(x?.id) && (x.outcome === 'fixed' || x.outcome === 'skipped')) results[x.id] = { outcome: x.outcome, note: text(x.note, 1000) }
+      done({ status: 'done', summary: text(so.summary, 2000), results, cost })
+    })
+  }
+
+  // What the fix changed: the working copy now compared with just before it started. Your own
+  // uncommitted work was in both, so only the fix's edits show.
+  async function recordFixDiff(r) {
+    const fix = r.fix
+    try {
+      const after = await snapshot(r.repo)
+      fix.after = after.sha
+      // -z: names as they are. Without it git quotes and escapes names like "räkning.js".
+      const numstat = await git(r.repo, ['diff', '--numstat', '-z', '--no-renames', fix.before, after.sha])
+      const files = numstat
+        .split('\0')
+        .filter(Boolean)
+        .slice(0, 100)
+        .map((l) => {
+          const [a, d, ...name] = l.split('\t')
+          return { file: name.join('\t'), added: Number(a) || 0, removed: Number(d) || 0, binary: a === '-' }
+        })
+      for (const f of files)
+        f.patch = f.binary
+          ? undefined
+          : (await git(r.repo, ['diff', '--no-renames', fix.before, after.sha, '--', `:(literal)${f.file}`]).catch(() => '')).slice(0, 60_000)
+      fix.files = files
+      const patch = files.length ? await git(r.repo, ['diff', '--binary', fix.before, after.sha], 50 * 1024 * 1024) : ''
+      fix.patch = patch.length <= MAX_FIX_PATCH ? patch : undefined
+      fix.undoable = !!fix.patch
+    } catch (e) {
+      fix.diffError = `Could not tell what the fix changed: ${e.message}`
+    }
+  }
+
+  function cancelFix(r) {
+    const child = fixProcs.get(r.id)
+    if (!child || r.fix?.status !== 'running') throw new Error('No fix is running')
+    fixProcs.delete(r.id)
+    // Wait for it to exit (a write in progress may still land), so the diff has all its edits.
+    const exited = new Promise((resolve) => {
+      const kill = setTimeout(() => {
+        child.kill('SIGKILL')
+        setTimeout(resolve, 1000).unref()
+      }, 5000).unref()
+      child.once('close', () => {
+        clearTimeout(kill)
+        resolve()
+      })
+    })
+    child.kill('SIGTERM')
+    Object.assign(r.fix, { status: 'cancelled', endedAt: Date.now() })
+    // No new fix in this repo until the diff is recorded: it would replace r.fix meanwhile.
+    fixBusy.add(r.repo)
+    // Edits made before it stopped stay: show them, so they can be undone.
+    return exited
+      .then(() => recordFixDiff(r))
+      .finally(() => fixBusy.delete(r.repo))
+      .then(changed)
+  }
+
+  // Takes back exactly the fix's edits. git apply is all or nothing: if those lines have changed
+  // since, nothing is touched and you're told why.
+  async function undoFix(r) {
+    const fix = r.fix
+    if (!fix || fix.status === 'running' || fix.status === 'undone') throw new Error('There is no fix to undo')
+    // Not while another fix edits (or is being stopped in) this working copy.
+    if (fixBusy.has(r.repo) || store.reviews.some((x) => x.repo === r.repo && x.fix?.status === 'running'))
+      throw new Error('A fix is running in this repository; undo when it has finished')
+    if (!fix.patch) throw new Error(fix.files?.length ? 'This fix is too big to undo from here' : 'The fix changed nothing')
+    const current = (await git(r.repo, ['branch', '--show-current']).catch(() => '')).trim()
+    if (current !== fix.branch) throw new Error(`The fix was made on ${fix.branch}; check it out to undo it`)
+    await gitInput(r.repo, ['apply', '-R', '--whitespace=nowarn', '-'], fix.patch).catch((e) => {
+      throw new Error(`Couldn't undo: the files changed after the fix (${e.message})`)
+    })
+    Object.assign(fix, { status: 'undone', undoneAt: Date.now() })
+    if (r.fixed) for (const id of Object.keys(fixedOf(fix))) delete r.fixed[id]
+    changed()
+  }
+
   const find = (id) => store.reviews.find((r) => r.id === id)
   // The full review, without where it ran on disk.
   const full = (r) => {
-    const { worktree, ...rest } = r
-    return { ...rest, ...summary(r), repoPath: r.repo }
+    const { worktree, fix, ...rest } = r
+    const shown = fix && (({ patch, ...f }) => f)(fix) // the undo patch stays on the server
+    return { ...rest, ...summary(r), fix: shown && { ...shown, agentId: fix.sessionId }, repoPath: r.repo }
   }
 
   function readJson(req, limit) {
@@ -647,9 +942,27 @@ export function createReviews({ dataDir, broadcast }) {
     if (m && !m[2] && req.method === 'GET') return json(200, full(r)), true
     if (m && !m[2] && req.method === 'DELETE') {
       cancel(r)
+      fixProcs.get(r.id)?.kill('SIGTERM') // its edits stay in the working copy, as with Stop
+      fixProcs.delete(r.id)
       store.reviews = store.reviews.filter((x) => x !== r)
       changed()
       return json(200, { ok: true }), true
+    }
+    const fm = /^\/api\/reviews\/(\w{1,16})\/fix(?:\/(cancel|undo))?$/.exec(p)
+    if (fm && req.method === 'POST') {
+      const fr = find(fm[1])
+      if (!fr) return req.resume(), json(404, { error: 'no such review' }), true
+      readJson(req, 4096).then(async (b) => {
+        try {
+          if (fm[2] === 'cancel') await cancelFix(fr)
+          else if (fm[2] === 'undo') await undoFix(fr)
+          else await startFix(fr, b)
+          json(200, full(fr))
+        } catch (e) {
+          json(e.busy ? 409 : 400, { error: e.message, busy: e.busy })
+        }
+      })
+      return true
     }
     if (m && !m[2] && req.method === 'POST') {
       // {cancel: true}: stop a running review but keep it in the list.
@@ -677,6 +990,7 @@ export function createReviews({ dataDir, broadcast }) {
   function shutdown() {
     if (saveTimer) clearTimeout(saveTimer), save() // don't lose what a burst of events changed
     for (const c of procs.values()) c.kill('SIGTERM')
+    for (const c of fixProcs.values()) c.kill('SIGTERM')
   }
 
   return { handle, publicList, noteCwd, shutdown }

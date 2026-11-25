@@ -847,7 +847,7 @@ export default function App() {
           onReviewChanges={(() => {
             const root = rootOf(sel, byId)
             // Only sessions in a git repo report a branch; a review's own agent isn't one to review.
-            if (!root.branch || reviews.some((r) => r.agentId === root.id)) return undefined
+            if (!root.branch || reviews.some((r) => r.agentId === root.id || r.fix?.agentId === root.id)) return undefined
             return () => {
               setReviewPrefill({ sessionId: root.id, at: Date.now() })
               selectReview(null)
@@ -856,7 +856,7 @@ export default function App() {
             }
           })()}
           onOpenReview={(() => {
-            const r = reviews.find((x) => x.agentId === sel.id)
+            const r = reviews.find((x) => x.agentId === sel.id || x.fix?.agentId === sel.id)
             return r
               ? () => {
                   selectReview(r.id)

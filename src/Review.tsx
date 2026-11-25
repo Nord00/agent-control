@@ -21,6 +21,7 @@ export interface ReviewSummary {
   createdAt: number
   endedAt?: number
   agentId: string
+  fix?: { status: FixStatus; agentId: string } // the latest fix of the accepted findings
   uncommitted?: boolean // the review included work that wasn't committed
   verdict?: keyof typeof VERDICT_LABEL
   counts: Record<Severity, number> // findings not dismissed
@@ -49,7 +50,31 @@ export interface Finding {
 }
 
 // Only with the token: the findings, the ticket, the repo's path.
-interface Review extends ReviewSummary {
+type FixStatus = 'running' | 'done' | 'failed' | 'cancelled' | 'undone'
+
+// A fix made in your working copy, and exactly what it changed there.
+interface Fix {
+  status: FixStatus
+  agentId: string
+  branch: string
+  findingIds: string[]
+  model?: string
+  effort?: string
+  startedAt: number
+  endedAt?: number
+  summary?: string
+  error?: string
+  cost?: number
+  results?: Record<string, { outcome: 'fixed' | 'skipped'; note?: string }>
+  files?: { file: string; added: number; removed: number; binary: boolean; patch?: string }[]
+  undoable?: boolean
+  diffError?: string
+}
+
+interface Review extends Omit<ReviewSummary, 'fix'> {
+  fix?: Fix
+  // What every fix so far fixed (not undone), kept when a later fix runs.
+  fixed?: Record<string, { outcome: 'fixed'; note?: string }>
   repoPath: string
   ticket?: string
   stat?: string
@@ -87,7 +112,7 @@ export default function ReviewView({ token, onUnlock, reviews, agents, selected,
       throw new Error('The token was not accepted')
     }
     const body = await r.json().catch(() => null)
-    if (!r.ok) throw new Error(body?.error ?? `Request failed (${r.status})`)
+    if (!r.ok) throw Object.assign(new Error(body?.error ?? `Request failed (${r.status})`), { status: r.status, body })
     return body
   }
 
@@ -132,7 +157,15 @@ export default function ReviewView({ token, onUnlock, reviews, agents, selected,
         </nav>
         <main className="rv-main">
           {current ? (
-            <ReviewDetail key={current.id} summary={current} api={api} agent={agents.get(current.agentId)} onShowAgent={onShowAgent} onSelect={onSelect} />
+            <ReviewDetail
+              key={current.id}
+              summary={current}
+              api={api}
+              agent={agents.get(current.agentId)}
+              fixAgent={current.fix ? agents.get(current.fix.agentId) : undefined}
+              onShowAgent={onShowAgent}
+              onSelect={onSelect}
+            />
           ) : (
             <NewReview api={api} onStarted={onSelect} prefill={prefill} />
           )}
@@ -589,10 +622,11 @@ function NewReview({ api, onStarted, prefill }: { api: Api; onStarted: (id: stri
 
 // --- One review ---
 
-function ReviewDetail({ summary, api, agent, onShowAgent, onSelect }: {
+function ReviewDetail({ summary, api, agent, fixAgent, onShowAgent, onSelect }: {
   summary: ReviewSummary
   api: Api
   agent?: Agent
+  fixAgent?: Agent
   onShowAgent: (id: string) => void
   onSelect: (id: string | null) => void
 }) {
@@ -607,18 +641,37 @@ function ReviewDetail({ summary, api, agent, onShowAgent, onSelect }: {
     writePref('ac.reviewOrder', o)
   }
   const [copied, setCopied] = useState(false)
+  const [fixOpen, setFixOpen] = useState(false)
   const [, tick] = useState(0)
 
+  // Start, stop or undo the fix. A 409 means another session works in the repo: ask first.
+  const fixAction = async (path: '' | '/cancel' | '/undo', body: Record<string, unknown> = {}) => {
+    setError('')
+    try {
+      setReview(await api<Review>(`/api/reviews/${summary.id}/fix${path}`, { method: 'POST', body }))
+      setFixOpen(false)
+    } catch (e) {
+      const err = e as Error & { status?: number; body?: { busy?: { name: string }[] } }
+      if (path === '' && err.status === 409) {
+        const names = err.body?.busy?.map((b) => b.name).join(', ') ?? 'Another session'
+        const go = window.confirm(`${names} is working in this repository right now. Two agents editing the same files can get in each other's way.\n\nFix anyway?`)
+        if (go) return fixAction('', { ...body, force: true })
+        return
+      }
+      setError(err.message)
+    }
+  }
+
   // Fetch again whenever the summary says something changed.
-  const version = `${summary.status}|${summary.endedAt}|${JSON.stringify(summary.counts)}`
+  const version = `${summary.status}|${summary.endedAt}|${JSON.stringify(summary.counts)}|${summary.fix?.status}`
   useEffect(() => {
     api<Review>(`/api/reviews/${summary.id}`).then(setReview, (e) => setError(e.message))
   }, [summary.id, version]) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
-    if (summary.status !== 'running') return
+    if (summary.status !== 'running' && summary.fix?.status !== 'running') return
     const t = setInterval(() => tick((n) => n + 1), 1000)
     return () => clearInterval(t)
-  }, [summary.status])
+  }, [summary.status, summary.fix?.status])
 
   const setStatus = async (f: Finding, status: Finding['status']) => {
     try {
@@ -667,6 +720,9 @@ function ReviewDetail({ summary, api, agent, onShowAgent, onSelect }: {
     groups.set(key, [...(groups.get(key) ?? []), f])
   }
   const accepted = findings.filter((f) => f.status === 'accepted')
+  // What a new fix would take on: accepted, and not already fixed by an earlier fix.
+  const lastFix = review?.fix && review.fix.status !== 'undone' ? review.fix : undefined
+  const toFix = accepted.filter((f) => !review?.fixed?.[f.id])
 
   const copyAccepted = async () => {
     const lines = [`Fix these review findings on branch ${summary.branch}:`, '']
@@ -777,6 +833,20 @@ function ReviewDetail({ summary, api, agent, onShowAgent, onSelect }: {
         </section>
       )}
 
+      {review?.fix && (
+        <FixCard
+          fix={review.fix}
+          agent={fixAgent}
+          findings={findings}
+          onStop={() => fixAction('/cancel')}
+          onUndo={() => {
+            if (window.confirm('Undo the fix? This takes back exactly the changes it made. Your own changes stay.')) void fixAction('/undo')
+          }}
+          onReviewAgain={again}
+          onShowAgent={onShowAgent}
+        />
+      )}
+
       {summary.status === 'done' && (
         <>
           <div className="rv-toolbar">
@@ -807,10 +877,40 @@ function ReviewDetail({ summary, api, agent, onShowAgent, onSelect }: {
             </span>
             {accepted.length > 0 && (
               <button className="panel-button" onClick={copyAccepted} title="Copy the accepted findings as a prompt to paste into a coding session">
-                {copied ? <><Icon.Check /> Copied</> : `Copy ${accepted.length} accepted as prompt`}
+                {copied ? <><Icon.Check /> Copied</> : 'Copy as prompt'}
+              </button>
+            )}
+            {findings.length > 0 && review?.fix?.status !== 'running' && (
+              // Always there, so you know it exists: it works on the findings you accept.
+              <button
+                className="ap-allow rv-fix-button"
+                disabled={!toFix.length}
+                onClick={() => setFixOpen((v) => !v)}
+                aria-expanded={fixOpen}
+                title={
+                  toFix.length
+                    ? 'An agent fixes the accepted findings in your working copy'
+                    : accepted.length
+                      ? 'The accepted findings are already fixed'
+                      : 'Accept the findings you want fixed, then fix them here'
+                }
+              >
+                <Icon.Wrench /> {toFix.length ? `Fix ${toFix.length} accepted` : 'Fix'}
               </button>
             )}
           </div>
+          {findings.length > 0 && !toFix.length && !accepted.length && (
+            <p className="hint rv-fix-hint">Press Accept on the findings you want fixed, then Fix lets an agent fix them in your working copy.</p>
+          )}
+          {fixOpen && toFix.length > 0 && (
+            <FixStart
+              branch={summary.branch}
+              count={toFix.length}
+              replaces={!!lastFix?.files?.length}
+              onStart={(model, effort) => fixAction('', { model, effort })}
+              onCancel={() => setFixOpen(false)}
+            />
+          )}
 
           {findings.length === 0 ? (
             <div className="rv-none card">
@@ -832,7 +932,13 @@ function ReviewDetail({ summary, api, agent, onShowAgent, onSelect }: {
                   </h3>
                 )}
                 {list.map((f) => (
-                  <FindingCard key={f.id} f={f} showFile={order === 'severity'} onStatus={(s) => setStatus(f, s)} />
+                  <FindingCard
+                    key={f.id}
+                    f={f}
+                    showFile={order === 'severity'}
+                    fixed={review?.fixed?.[f.id] ?? lastFix?.results?.[f.id]}
+                    onStatus={(s) => setStatus(f, s)}
+                  />
                 ))}
               </section>
             ))
@@ -843,7 +949,12 @@ function ReviewDetail({ summary, api, agent, onShowAgent, onSelect }: {
   )
 }
 
-function FindingCard({ f, showFile, onStatus }: { f: Finding; showFile: boolean; onStatus: (s: Finding['status']) => void }) {
+function FindingCard({ f, showFile, fixed, onStatus }: {
+  f: Finding
+  showFile: boolean
+  fixed?: { outcome: 'fixed' | 'skipped'; note?: string }
+  onStatus: (s: Finding['status']) => void
+}) {
   const dismissed = f.status === 'dismissed'
   const toggle = (s: 'accepted' | 'dismissed') => onStatus(f.status === s ? 'open' : s)
   return (
@@ -854,6 +965,11 @@ function FindingCard({ f, showFile, onStatus }: { f: Finding; showFile: boolean;
         <h4>
           <Prose text={f.title} />
         </h4>
+        {fixed && (
+          <span className={`rv-fixed ${fixed.outcome}`} title={fixed.note}>
+            {fixed.outcome === 'fixed' ? 'Fixed by agent' : 'Skipped by agent'}
+          </span>
+        )}
         {showFile && f.file ? (
           <code className="rv-loc" title={f.file}>
             {f.file}
@@ -898,6 +1014,211 @@ function FindingCard({ f, showFile, onStatus }: { f: Finding; showFile: boolean;
         </button>
       </div>
     </article>
+  )
+}
+
+// Which model fixes and how hard it thinks, then go. Remembered like the review's choice.
+function FixStart({ branch, count, replaces, onStart, onCancel }: {
+  branch: string
+  count: number
+  replaces: boolean // the last fix's changes are still in place
+  onStart: (model: string, effort: string) => Promise<void> | void
+  onCancel: () => void
+}) {
+  const [model, setModel] = useState(() => readChoice('ac.fixModel', MODELS, 'claude-sonnet-5-5'))
+  const [effort, setEffort] = useState(() => readChoice('ac.fixEffort', EFFORTS, ''))
+  const [busy, setBusy] = useState(false)
+  return (
+    <div className="rv-fix-start card">
+      <p>
+        An agent fixes the {count} accepted finding{count === 1 ? '' : 's'} in your working copy on <b>{branch}</b>. It can only
+        edit files: no commands, no commits, no branch switching. You see exactly what it changed afterwards, and can undo it.
+      </p>
+      {replaces && (
+        <p className="rv-warn">
+          The last fix's changes stay in your working copy, but after this you can only undo the new fix from here.
+        </p>
+      )}
+      <div className="rv-fix-row">
+        <select
+          value={model}
+          aria-label="Model"
+          onChange={(e) => {
+            setModel(e.target.value)
+            writePref('ac.fixModel', e.target.value)
+          }}
+        >
+          {MODELS.map(([id, label]) => (
+            <option key={id} value={id}>
+              {label}
+            </option>
+          ))}
+        </select>
+        <select
+          value={effort}
+          aria-label="Effort"
+          onChange={(e) => {
+            setEffort(e.target.value)
+            writePref('ac.fixEffort', e.target.value)
+          }}
+        >
+          {EFFORTS.map(([id, label]) => (
+            <option key={id} value={id}>
+              {id ? `${label} effort` : 'Default effort'}
+            </option>
+          ))}
+        </select>
+        <span className="rv-spacer" />
+        <button className="panel-button" onClick={onCancel}>
+          Cancel
+        </button>
+        <button
+          className="ap-allow rv-fix-button"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true)
+            await onStart(model, effort)
+            setBusy(false)
+          }}
+        >
+          {busy ? 'Starting…' : 'Start fix'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+const FIX_TITLE: Record<FixStatus, string> = {
+  running: 'Fixing…',
+  done: 'Fix done',
+  failed: 'The fix failed',
+  cancelled: 'The fix was stopped',
+  undone: 'Fix undone',
+}
+
+function FixCard({ fix, agent, findings, onStop, onUndo, onReviewAgain, onShowAgent }: {
+  fix: Fix
+  agent?: Agent
+  findings: Finding[]
+  onStop: () => void
+  onUndo: () => void
+  onReviewAgain: () => void
+  onShowAgent: (id: string) => void
+}) {
+  const files = fix.files ?? []
+  const fixedCount = Object.values(fix.results ?? {}).filter((r) => r.outcome === 'fixed').length
+  const skipped = Object.entries(fix.results ?? {}).filter(([, r]) => r.outcome === 'skipped')
+  const title = (id: string) => findings.find((f) => f.id === id)?.title ?? id
+  const end = fix.endedAt ?? Date.now()
+  return (
+    <section className={`rv-fix card ${fix.status}`}>
+      <div className="rv-fix-head">
+        {fix.status === 'running' ? <span className="rv-spinner" aria-hidden="true" /> : <Icon.Wrench />}
+        <div className="rv-fix-title">
+          <b>{FIX_TITLE[fix.status]}</b>
+          <small>
+            {fix.findingIds.length} finding{fix.findingIds.length === 1 ? '' : 's'} on {fix.branch}
+            {' · '}
+            {modelLabel(fix.model)}
+            {fix.status === 'running' ? ` · ${fmtDuration(end - fix.startedAt)}` : ` · took ${fmtDuration(end - fix.startedAt)}`}
+            {fix.cost != null && ` · ${fmtCost(fix.cost)} est.`}
+          </small>
+        </div>
+        <span className="rv-spacer" />
+        {agent && (
+          <button className="panel-button" onClick={() => onShowAgent(agent.id)}>
+            <Icon.Eye /> Agent
+          </button>
+        )}
+        {fix.status === 'running' ? (
+          <button className="panel-button" onClick={onStop}>
+            Stop
+          </button>
+        ) : (
+          <>
+            {fix.status !== 'undone' && files.length > 0 && fix.undoable && (
+              <button className="panel-button" onClick={onUndo} title="Take back exactly the changes this fix made">
+                Undo fix
+              </button>
+            )}
+            {fix.status !== 'undone' && files.length > 0 && (
+              <button className="ap-allow rv-fix-button" onClick={onReviewAgain} title="Review the branch again, with the fix">
+                Review again
+              </button>
+            )}
+          </>
+        )}
+      </div>
+
+      {fix.status === 'running' && <p className="hint">{agent?.task || 'Starting the fix agent'}</p>}
+      {fix.summary && fix.status !== 'running' && (
+        <p className="rv-fix-summary">
+          <Prose text={fix.summary} />
+          {fix.results && ` (${fixedCount} fixed${skipped.length ? `, ${skipped.length} skipped` : ''})`}
+        </p>
+      )}
+      {fix.error && <pre className="rv-fix-error">{fix.error}</pre>}
+      {fix.diffError && <p className="ap-error">{fix.diffError}</p>}
+      {skipped.length > 0 && fix.status !== 'undone' && (
+        <ul className="rv-skipped">
+          {skipped.map(([id, r]) => (
+            <li key={id}>
+              <b>Skipped: {title(id)}</b> {r.note && <span>{r.note}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {fix.status !== 'running' && fix.status !== 'undone' && (
+        <div className="rv-fix-files">
+          {files.length === 0 ? (
+            <p className="hint">The fix didn't change any files.</p>
+          ) : (
+            <>
+              <p className="hint">
+                Changed in your working copy, not committed. Only the fix's own edits are shown, not your other uncommitted work.
+                {!fix.undoable && ' This fix is too big to undo from here.'}
+              </p>
+              {files.map((f) => (
+                <details key={f.file} className="rv-fix-file">
+                  <summary>
+                    <code>{f.file}</code>
+                    <span className="rv-plus">+{f.added}</span>
+                    <span className="rv-minus">−{f.removed}</span>
+                  </summary>
+                  {f.binary ? <p className="hint">Binary file</p> : <PatchView patch={f.patch ?? ''} />}
+                </details>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+      {fix.status === 'undone' && <p className="hint">The fix's changes were taken back. Your own changes are as they were.</p>}
+    </section>
+  )
+}
+
+// A unified diff for one file, without the git headers.
+function PatchView({ patch }: { patch: string }) {
+  // Drop git's headers, which come before the first @@. After that, a line like "--- x" is a
+  // removed line that started with "-- ", not a header.
+  const all = patch.split('\n')
+  const lines = all.slice(Math.max(0, all.findIndex((l) => l.startsWith('@@')))).filter(Boolean)
+  return (
+    <div className="rv-hunk rv-patch">
+      <table>
+        <tbody>
+          {lines.map((l, i) => {
+            const kind = l.startsWith('@@') ? 'hdr' : l[0] === '+' ? 'add' : l[0] === '-' ? 'del' : 'ctx'
+            return (
+              <tr key={i} className={kind}>
+                <td className="sign">{kind === 'add' ? '+' : kind === 'del' ? '−' : ''}</td>
+                <td className="code">{kind === 'hdr' ? l : l.slice(1) || ' '}</td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
   )
 }
 

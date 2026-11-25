@@ -518,7 +518,7 @@ server.on('upgrade', (req, socket) => {
 
 load()
 loadSettings()
-const reviews = createReviews({ dataDir: path.dirname(DATA_FILE), broadcast })
+const reviews = createReviews({ dataDir: path.dirname(DATA_FILE), broadcast, agents: () => [...agents.values()] })
 prune()
 setInterval(prune, 60 * 60 * 1000).unref()
 for (const sig of ['SIGINT', 'SIGTERM']) {

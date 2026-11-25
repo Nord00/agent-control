@@ -31,6 +31,19 @@ import fs from 'node:fs'
 let prompt = ''
 process.stdin.on('data', (c) => (prompt += c)).on('end', () => {
   const args = process.argv.slice(2)
+  if (prompt.includes('## Findings to fix')) {
+    // Fix mode: edit the file like a fix agent would, and report which tools it was allowed.
+    const allowed = args.slice(args.indexOf('--allowedTools') + 1, args.indexOf('--disallowedTools'))
+    fs.appendFileSync('app.js', '// fixed\n')
+    fs.writeFileSync('räkning.js', '-- a line that looks like a diff header\n') // a name git would quote
+    const denied = args.slice(args.indexOf('--disallowedTools') + 1)
+    const edit = ['Edit(./**)', 'Write(./**)'].every((t) => allowed.includes(t))
+    const unscoped = allowed.some((t) => /^(Edit|Write)$/.test(t)) // a bare Edit/Write reaches outside the repo
+    const gitdir = ['Edit', 'Write'].every((t) => denied.some((d) => d.startsWith(`${t}(//`) && d.endsWith('/.git/**)')))
+    const summary = `bash=${allowed.some((t) => t.startsWith('Bash'))} edit=${edit} unscoped=${unscoped} gitdir=${gitdir} mode=${args[args.indexOf('--permission-mode') + 1]}`
+    console.log(JSON.stringify({ type: 'result', is_error: false, total_cost_usd: 0.02, structured_output: { summary, results: [{ id: 'f1', outcome: 'fixed', note: 'n' }, { id: 'f9', outcome: 'fixed', note: 'not asked' }] } }))
+    return
+  }
   if (prompt.includes('PLEASE-FAIL')) {
     process.stderr.write('stub: asked to fail\n')
     process.exit(3)
@@ -411,6 +424,51 @@ st=$(rwait "$rid")
 git -C "$CLONE" remote set-url origin "$REVIEW_TMP/no-such-remote"
 got=$(bl force | jget '[!!v.fetchError, v.branches.some(b=>b.name==="origin/pushed-later")].join()')
 [ "$got" = "true,true" ] && ok "A failed fetch is reported and the last fetched branches stay" || bad "failed fetch: '$got' (want true,true)"
+
+# Fix: edits the accepted findings in the working copy of the checked-out branch, and nothing else.
+fwait() { # $1 review id -> the fix's final status
+  for _ in $(seq 1 50); do
+    st=$(curl -s "$base/api/reviews/$1" -H "$auth" | jget 'v.fix?.status')
+    [ "$st" != running ] && break
+    sleep 0.2
+  done
+  echo "$st"
+}
+printf 'export function ratio(a, b) {\n  return a / b\n}\n' >"$REPO/app.js" # your own work in progress
+printf 'my notes\n' >"$REPO/notes.txt" && g add notes.txt                   # staged by you
+xid=$(rpost /api/reviews "{\"repo\":\"$REPO_TOP\",\"branch\":\"main\",\"base\":\"main\",\"includeUncommitted\":true}" | jget v.id)
+rwait "$xid" >/dev/null
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/reviews/$xid/fix" -H "$auth" -d '{}')
+[ "$code" = 400 ] && ok "Fixing with no accepted findings -> 400" || bad "fix without accepted -> $code (want 400)"
+rpost "/api/reviews/$xid/findings/f1" '{"status":"accepted"}' >/dev/null
+curl -s -o /dev/null -X POST "$base/events" -H "$auth" -d "{\"app\":\"claude\",\"session_id\":\"verify-busy\",\"hook_event_name\":\"UserPromptSubmit\",\"cwd\":\"$REPO\"}"
+for _ in $(seq 1 20); do [ -n "$(curl -s "$base/api/review/session/verify-busy" -H "$auth" | jget v.repo)" ] && break; sleep 0.1; done
+busy=$(curl -s -X POST "$base/api/reviews/$xid/fix" -H "$auth" -d '{}' -w ' %{http_code}')
+case "$busy" in *'"id":"verify-busy"'*' 409') ok "Another session working in the repo -> 409, asking first" ;; *) bad "busy repo: $busy" ;; esac
+state_before=$(git -C "$REPO" rev-parse HEAD; git -C "$REPO" branch --show-current; git -C "$REPO" diff --cached)
+rpost "/api/reviews/$xid/fix" '{"force":true}' >/dev/null
+st=$(fwait "$xid")
+fx=$(curl -s "$base/api/reviews/$xid" -H "$auth")
+got=$(echo "$fx" | jget '[v.fix.summary, v.fix.results.f1?.outcome, !!v.fix.results.f9, v.fix.files.map(f=>f.file+":"+f.added).join(" "), v.fix.undoable, v.fix.patch===undefined].join()')
+[ "$st" = done ] && [ "$got" = "bash=false edit=true unscoped=false gitdir=true mode=dontAsk,fixed,false,app.js:1 räkning.js:1,true,true" ] \
+  && ok "The fix agent may edit files only inside the repo (not its absolute git dir) and not run commands, and its result lists only its own edits" || bad "fix: '$st' '$got' ($(echo "$fx" | jget v.fix.error))"
+state_after=$(git -C "$REPO" rev-parse HEAD; git -C "$REPO" branch --show-current; git -C "$REPO" diff --cached)
+last=$(tail -n 1 "$REPO/app.js")
+got=$(echo "$fx" | jget 'v.fix.files.find(f=>f.file==="räkning.js")?.patch.includes("+-- a line")')
+[ "$got" = true ] && ok "Files with names like räkning.js get their diff in the fix" || bad "diff for räkning.js: '$got'"
+[ "$state_before" = "$state_after" ] && [ "$last" = "// fixed" ] && ok "The fix edits the working copy: no commit, same branch, staging area untouched" || bad "fix changed HEAD, branch or staging (last line '$last')"
+msg=$(curl -s -X POST "$base/api/reviews/$xid/fix" -H "$auth" -d '{"force":true}' | jget v.error)
+[ "$msg" = "The accepted findings are already fixed" ] && ok "Findings the last fix fixed aren't sent again" || bad "second fix: '$msg'"
+rpost "/api/reviews/$xid/fix/undo" '{}' >/dev/null
+got=$(cat "$REPO/app.js"; git -C "$REPO" diff --cached --name-only)
+[ "$got" = "$(printf 'export function ratio(a, b) {\n  return a / b\n}\nnotes.txt')" ] && [ ! -e "$REPO/räkning.js" ] && ok "Undo takes back only the fix, your own changes stay" || bad "after undo: '$got'"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/reviews/$xid/fix/undo" -H "$auth" -d '{}')
+[ "$code" = 400 ] && ok "Undoing twice -> 400" || bad "second undo -> $code (want 400)"
+rpost "/api/reviews/$rid/findings/f1" '{"status":"accepted"}' >/dev/null
+msg=$(curl -s -X POST "$base/api/reviews/$rid/fix" -H "$auth" -d '{"force":true}' | jget v.error)
+case "$msg" in *"feature isn't checked out (you're on main)"*) ok "Fixing a branch that isn't checked out -> refused, never switches" ;; *) bad "fix on other branch: '$msg'" ;; esac
+curl -s -o /dev/null -X POST "$base/events" -H "$auth" -d '{"app":"claude","session_id":"verify-busy","hook_event_name":"SessionEnd"}'
+g reset -q && git -C "$REPO" checkout -q -- app.js && rm -f "$REPO/notes.txt"
 
 step "Startup cleanup of saved helper subagents"
 GDIR=$(mktemp -d)
