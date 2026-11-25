@@ -63,18 +63,20 @@ const SCHEMA = {
 
 const text = (v, n) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, n) : undefined)
 
-// Never wait for a password or a host-key prompt: nobody would see it.
+// Never wait for a password or a host-key prompt: nobody would see it. No optional locks either:
+// `git status` would otherwise take index.lock in your repo while you or an agent work in it.
 const GIT_ENV = {
   ...process.env,
   GIT_TERMINAL_PROMPT: '0',
+  GIT_OPTIONAL_LOCKS: '0',
   GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND || 'ssh -o BatchMode=yes',
 }
 const FETCH_TIMEOUT_MS = 20_000
 const FETCH_EVERY_MS = 30_000 // picking the same repo again within this reuses the last fetch
 
-function git(cwd, args, maxBuffer = 20 * 1024 * 1024, timeout = 0) {
+function git(cwd, args, maxBuffer = 20 * 1024 * 1024, timeout = 0, env = {}) {
   return new Promise((resolve, reject) => {
-    execFile('git', ['-C', cwd, ...args], { maxBuffer, encoding: 'utf8', env: GIT_ENV, timeout }, (err, stdout, stderr) => {
+    execFile('git', ['-C', cwd, ...args], { maxBuffer, encoding: 'utf8', env: { ...GIT_ENV, ...env }, timeout }, (err, stdout, stderr) => {
       if (err) reject(new Error(err.killed ? 'timed out' : (stderr || err.message).trim().split('\n')[0].slice(0, 300)))
       else resolve(stdout)
     })
@@ -83,6 +85,30 @@ function git(cwd, args, maxBuffer = 20 * 1024 * 1024, timeout = 0) {
 
 // A ref the user picked: never something git would read as an option.
 const refOk = (r) => typeof r === 'string' && r.length > 0 && r.length <= 200 && !r.startsWith('-') && !/[\s\0~^:?*[\\]/.test(r)
+
+// A commit of the working copy as it is now (changed, new and deleted files; not ignored ones),
+// on top of HEAD. Built with a throwaway index, so your staging area, checkout and branches stay
+// as they are. Returns HEAD itself when nothing is uncommitted.
+async function snapshot(repo) {
+  const head = (await git(repo, ['rev-parse', '--verify', 'HEAD^{commit}'])).trim()
+  // A copy of the real index, next to it: it has the stat cache (so `add -A` only reads files
+  // that changed) and what you staged, and split-index files are found from there.
+  const real = path.resolve(repo, (await git(repo, ['rev-parse', '--git-path', 'index'])).trim())
+  const index = `${real}.agent-control-${crypto.randomBytes(6).toString('hex')}`
+  try {
+    const env = { GIT_INDEX_FILE: index }
+    if (fs.existsSync(real)) fs.copyFileSync(real, index)
+    else await git(repo, ['read-tree', head], undefined, 0, env) // nothing ever staged
+    await git(repo, ['add', '-A', '--', '.'], undefined, 60_000, env)
+    const tree = (await git(repo, ['write-tree'], undefined, 0, env)).trim()
+    if (tree === (await git(repo, ['rev-parse', `${head}^{tree}`])).trim()) return { sha: head, dirty: false }
+    const who = { GIT_AUTHOR_NAME: 'Agent Control', GIT_AUTHOR_EMAIL: 'agent-control@localhost', GIT_COMMITTER_NAME: 'Agent Control', GIT_COMMITTER_EMAIL: 'agent-control@localhost' }
+    const sha = (await git(repo, ['commit-tree', '--no-gpg-sign', tree, '-p', head, '-m', 'Uncommitted changes (snapshot for review)'], undefined, 0, who)).trim()
+    return { sha, dirty: true }
+  } finally {
+    fs.rmSync(index, { force: true })
+  }
+}
 
 function buildPrompt(r) {
   const range = `${r.mergeBase}..${r.headSha}`
@@ -96,7 +122,7 @@ The working directory is a read-only checkout of the branch. Don't change any fi
 - Commits: \`git log --oneline ${range}\`
 - Diff: \`git diff ${range}\` (add \`-- <path>\` for one file)
 - ${r.stat}
-${ticket}
+${r.uncommitted ? `- The last commit, "Uncommitted changes (snapshot for review)", is work in progress that isn't committed yet. Review it like the rest.\n` : ''}${ticket}
 ## What to look for
 Correctness bugs, security problems, missed requirements, broken edge cases and error handling, and
 risky changes without tests. Read the surrounding code and callers before you report something.
@@ -163,13 +189,20 @@ export function createReviews({ dataDir, broadcast }) {
   const FILE = path.join(dataDir, 'reviews.json')
   /** @type {{repos: string[], reviews: object[]}} */
   // repos: added by hand. seen: repos that sessions ran in (from the hooks' cwd), newest first.
-  let store = { repos: [], seen: [], reviews: [] }
+  // removed: repos you took off the list; hook events don't bring them back, only you do.
+  let store = { repos: [], seen: [], removed: [], reviews: [] }
+  // Session id -> the repo it runs in, for "Review changes" on an agent. A Map, so ids like
+  // "constructor" or "__proto__" are just ids.
+  const sessions = new Map()
   const procs = new Map() // review id -> child process
 
   try {
     const s = JSON.parse(fs.readFileSync(FILE, 'utf8'))
     if (Array.isArray(s?.repos)) store.repos = s.repos.filter((r) => typeof r === 'string')
     if (Array.isArray(s?.seen)) store.seen = s.seen.filter((r) => typeof r === 'string')
+    if (Array.isArray(s?.removed)) store.removed = s.removed.filter((r) => typeof r === 'string')
+    if (s?.sessions && typeof s.sessions === 'object' && !Array.isArray(s.sessions))
+      for (const [id, repo] of Object.entries(s.sessions)) if (typeof repo === 'string') sessions.set(id, repo)
     if (Array.isArray(s?.reviews)) store.reviews = s.reviews.filter((r) => typeof r?.id === 'string')
   } catch {} // first run
   // Their process didn't survive the restart.
@@ -185,7 +218,7 @@ export function createReviews({ dataDir, broadcast }) {
   function save() {
     try {
       fs.mkdirSync(dataDir, { recursive: true })
-      fs.writeFileSync(`${FILE}.tmp`, JSON.stringify(store), { mode: 0o600 })
+      fs.writeFileSync(`${FILE}.tmp`, JSON.stringify({ ...store, sessions: Object.fromEntries(sessions) }), { mode: 0o600 })
       fs.renameSync(`${FILE}.tmp`, FILE)
     } catch (e) {
       console.warn(`Could not save ${FILE}: ${e.message}`)
@@ -200,6 +233,7 @@ export function createReviews({ dataDir, broadcast }) {
       repo: path.basename(r.repo),
       branch: r.branch,
       base: r.base,
+      uncommitted: r.uncommitted || undefined,
       status: r.status,
       createdAt: r.createdAt,
       endedAt: r.endedAt,
@@ -230,7 +264,9 @@ export function createReviews({ dataDir, broadcast }) {
     const top = (await git(p.replace(/^~(?=\/)/, os.homedir()), ['rev-parse', '--show-toplevel']).catch(() => {
       throw new Error(`Not a git repository: ${p}`)
     })).trim()
-    if (!store.repos.includes(top)) store.repos.push(top), save()
+    unremove(top)
+    if (!store.repos.includes(top)) store.repos.push(top)
+    save()
     return top
   }
 
@@ -244,16 +280,49 @@ export function createReviews({ dataDir, broadcast }) {
     }
   }
   const checked = new Map() // cwd -> its repo's top folder, or '' if none; once per server run
-  async function noteCwd(cwd) {
-    if (typeof cwd !== 'string' || !path.isAbsolute(cwd) || cwd.length > 500 || checked.has(cwd)) return
-    checked.set(cwd, '')
-    const top = (await git(cwd, ['rev-parse', '--show-toplevel']).catch(() => '')).trim()
-    checked.set(cwd, top)
-    // A review's own checkout is not a repo to offer.
-    if (!top || store.seen[0] === top || worktreeRoots().some((w) => top.startsWith(w + path.sep))) return
-    store.seen = [top, ...store.seen.filter((r) => r !== top)].slice(0, 50)
-    save()
+  // Saves what hook events change at most once a second: they come in bursts.
+  let saveTimer
+  const saveSoon = () => {
+    saveTimer ??= setTimeout(() => {
+      saveTimer = undefined
+      save()
+    }, 1000)
   }
+
+  async function noteCwd(cwd, sessionId) {
+    if (typeof cwd !== 'string' || !path.isAbsolute(cwd) || cwd.length > 500) return
+    const first = !checked.has(cwd) // the list order only changes the first time a folder is seen
+    if (first) checked.set(cwd, git(cwd, ['rev-parse', '--show-toplevel']).then((t) => t.trim(), () => ''))
+    const top = await checked.get(cwd)
+    // A review's own checkout is not a repo to offer.
+    if (!top || worktreeRoots().some((w) => top.startsWith(w + path.sep))) return
+    let dirty = false
+    if (typeof sessionId === 'string' && sessionId && sessionId.length <= 100 && sessions.get(sessionId) !== top) {
+      sessions.delete(sessionId) // newest last, so the oldest go first
+      sessions.set(sessionId, top)
+      for (const id of [...sessions.keys()].slice(0, Math.max(0, sessions.size - 300))) sessions.delete(id)
+      dirty = true
+    }
+    if (first && store.seen[0] !== top && !store.removed.includes(top)) {
+      store.seen = [top, ...store.seen.filter((r) => r !== top)].slice(0, 50)
+      dirty = true
+    }
+    if (dirty) saveSoon()
+  }
+  const unremove = (repo) => (store.removed = store.removed.filter((r) => r !== repo))
+  // The repo a session ran in, offered again if it has since dropped off the list (or was removed).
+  async function sessionRepo(id) {
+    const repo = sessions.get(id)
+    if (!repo) throw new Error("Don't know which repository this session is in")
+    if (known(repo)) return repo
+    const top = (await git(repo, ['rev-parse', '--show-toplevel']).catch(() => '')).trim()
+    if (top !== repo) throw new Error(`${repo} is no longer a git repository`)
+    unremove(repo) // you asked to review it
+    store.seen = [repo, ...store.seen].slice(0, 50)
+    save()
+    return repo
+  }
+
   const repoList = () => [
     ...store.repos.map((r) => ({ path: r, name: path.basename(r), source: 'added' })),
     ...store.seen.filter((r) => !store.repos.includes(r)).map((r) => ({ path: r, name: path.basename(r), source: 'session' })),
@@ -335,10 +404,13 @@ export function createReviews({ dataDir, broadcast }) {
     if (!local && names.has(`origin/${base}`)) base = `origin/${base}`
     else if (local?.behind) base = local.remote
     const current = (await git(repo, ['branch', '--show-current']).catch(() => '')).trim()
+    // Files changed, added or deleted and not committed (ignored ones don't count).
+    const dirty = (await git(repo, ['status', '--porcelain']).catch(() => '')).split('\n').filter(Boolean).length
     return {
       branches: list,
       base,
       current,
+      dirty,
       fetchedAt: f && !f.none ? f.at : undefined,
       fetchError: f?.error,
       hasRemote: remotes.length > 0,
@@ -350,13 +422,25 @@ export function createReviews({ dataDir, broadcast }) {
     if (!known(repo)) throw new Error('Unknown repository: add it first')
     const { branch, base } = body
     if (!refOk(branch) || !refOk(base)) throw new Error('Pick a branch and a base branch')
-    if (branch === base) throw new Error('The branch and the base are the same')
+    // true: include the uncommitted work (the branch must be checked out). 'auto' (Run again):
+    // include it if the branch is still checked out, else review the branch as committed.
+    const current = (await git(repo, ['branch', '--show-current']).catch(() => '')).trim()
+    const withUncommitted = body.includeUncommitted === true || (body.includeUncommitted === 'auto' && current === branch)
+    if (branch === base && !withUncommitted) throw new Error('The branch and the base are the same')
     if (procs.size >= MAX_RUNNING) throw new Error(`At most ${MAX_RUNNING} reviews can run at once`)
     const sha = (ref) => git(repo, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).then((s) => s.trim(), () => { throw new Error(`No such branch: ${ref}`) })
-    const headSha = await sha(branch)
+    let headSha = await sha(branch)
+    let uncommitted = false
+    if (withUncommitted) {
+      if (current !== branch) throw new Error(`Uncommitted changes can only be included for the checked-out branch${current ? ` (${current})` : ''}`)
+      const snap = await snapshot(repo)
+      headSha = snap.sha
+      uncommitted = snap.dirty
+    }
     const baseSha = await sha(base)
     const mergeBase = (await git(repo, ['merge-base', baseSha, headSha])).trim()
-    if (mergeBase === headSha) throw new Error(`${branch} has no changes that aren't already in ${base}`)
+    if (mergeBase === headSha)
+      throw new Error(withUncommitted ? `No changes: ${branch} is the same as ${base} and nothing is uncommitted` : `${branch} has no changes that aren't already in ${base}`)
     const stat = (await git(repo, ['diff', '--shortstat', mergeBase, headSha])).trim() || 'No file changes'
 
     const id = crypto.randomBytes(4).toString('hex')
@@ -370,6 +454,7 @@ export function createReviews({ dataDir, broadcast }) {
       baseSha,
       mergeBase,
       stat,
+      uncommitted,
       ticket: text(body.ticket, 20000),
       sessionId: crypto.randomUUID(),
       worktree: path.join(WORKTREES, `${slug(path.basename(repo))}-review-${slug(branch)}-${id}`),
@@ -514,6 +599,8 @@ export function createReviews({ dataDir, broadcast }) {
           if (b?.remove) {
             store.repos = store.repos.filter((r) => r !== b.remove)
             store.seen = store.seen.filter((r) => r !== b.remove)
+            if (typeof b.remove === 'string' && b.remove.length <= 500)
+              store.removed = [b.remove, ...store.removed.filter((r) => r !== b.remove)].slice(0, 100)
             save()
             return json(200, { repos: repoList() })
           }
@@ -531,6 +618,14 @@ export function createReviews({ dataDir, broadcast }) {
       return true
     }
     if (p === '/api/reviews' && req.method === 'GET') return json(200, publicList()), true
+    const sm = /^\/api\/review\/session\/([\w-]{1,100})$/.exec(p)
+    if (sm && req.method === 'GET') {
+      sessionRepo(sm[1]).then(
+        (repo) => json(200, { repo, name: path.basename(repo) }),
+        (e) => json(404, { error: e.message }),
+      )
+      return true
+    }
     if (p === '/api/reviews' && req.method === 'POST') {
       readJson(req, 65536).then((b) => start(b).then((r) => json(200, full(r)), fail))
       return true
@@ -568,5 +663,10 @@ export function createReviews({ dataDir, broadcast }) {
     return req.resume(), json(404, { error: 'not found' }), true
   }
 
-  return { handle, publicList, noteCwd, shutdown: () => [...procs.values()].forEach((c) => c.kill('SIGTERM')) }
+  function shutdown() {
+    if (saveTimer) clearTimeout(saveTimer), save() // don't lose what a burst of events changed
+    for (const c of procs.values()) c.kill('SIGTERM')
+  }
+
+  return { handle, publicList, noteCwd, shutdown }
 }

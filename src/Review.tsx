@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { TokenForm } from './Approvals'
 import { fmtAgo, fmtCost, fmtDuration } from './format'
 import type { Agent } from './sim'
@@ -21,6 +21,7 @@ export interface ReviewSummary {
   createdAt: number
   endedAt?: number
   agentId: string
+  uncommitted?: boolean // the review included work that wasn't committed
   verdict?: keyof typeof VERDICT_LABEL
   counts: Record<Severity, number> // findings not dismissed
   total: number
@@ -67,11 +68,12 @@ interface Props {
   reviews: ReviewSummary[]
   agents: Map<string, Agent>
   selected: string | null // review id, or null for the new-review form
+  prefill?: { sessionId: string; at: number } // "Review changes" on an agent: its repo, branch and uncommitted work
   onSelect: (id: string | null) => void
   onShowAgent: (id: string) => void
 }
 
-export default function ReviewView({ token, onUnlock, reviews, agents, selected, onSelect, onShowAgent }: Props) {
+export default function ReviewView({ token, onUnlock, reviews, agents, selected, onSelect, onShowAgent, prefill }: Props) {
   const api: Api = async (path, init) => {
     const r = await fetch(path, {
       method: init?.method ?? 'GET',
@@ -112,7 +114,10 @@ export default function ReviewView({ token, onUnlock, reviews, agents, selected,
                 <button className={`rv-item${r.id === current?.id ? ' active' : ''}`} onClick={() => onSelect(r.id)}>
                   <span className={`lv-dot ${r.status === 'running' ? 'working' : r.status === 'done' ? 'completed' : 'ended'}`} />
                   <span className="rv-item-text">
-                    <b>{r.branch}</b>
+                    <b>
+                      {r.branch}
+                      {r.uncommitted && <span className="rv-wip" title="Includes uncommitted changes"> + uncommitted</span>}
+                    </b>
                     <small>
                       {r.repo} · {r.status === 'running' ? 'Reviewing…' : r.status === 'done' ? fmtAgo(Date.now() - (r.endedAt ?? r.createdAt)) : STATUS_TEXT[r.status]}
                     </small>
@@ -127,7 +132,7 @@ export default function ReviewView({ token, onUnlock, reviews, agents, selected,
           {current ? (
             <ReviewDetail key={current.id} summary={current} api={api} agent={agents.get(current.agentId)} onShowAgent={onShowAgent} onSelect={onSelect} />
           ) : (
-            <NewReview api={api} onStarted={onSelect} />
+            <NewReview api={api} onStarted={onSelect} prefill={prefill} />
           )}
         </main>
       </div>
@@ -168,6 +173,7 @@ interface Branches {
   base: string
   current: string
   hasRemote: boolean
+  dirty: number // uncommitted files in the working copy
   fetchedAt?: number
   fetchError?: string
 }
@@ -209,7 +215,9 @@ const writePref = (k: string, v: string) => {
   } catch {}
 }
 
-function NewReview({ api, onStarted }: { api: Api; onStarted: (id: string) => void }) {
+let prefillApplied = 0 // a prefill is used once, not again when the form opens later
+
+function NewReview({ api, onStarted, prefill }: { api: Api; onStarted: (id: string) => void; prefill?: Props['prefill'] }) {
   const [repos, setRepos] = useState<Repo[] | null>(null)
   const [repo, setRepo] = useState(() => readPref('ac.reviewRepo') ?? '')
   const [adding, setAdding] = useState(false)
@@ -220,6 +228,26 @@ function NewReview({ api, onStarted }: { api: Api; onStarted: (id: string) => vo
   const [ticket, setTicket] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [withUncommitted, setWithUncommitted] = useState(true)
+  // Set by "Review changes": in that repo, pick the checked-out branch. Picking another repo or
+  // branch yourself ends it.
+  const preferCurrent = useRef<string | null>(null)
+
+  // "Review changes" on an agent: its repository, the branch it's on, and what isn't committed.
+  useEffect(() => {
+    if (!prefill || prefill.at <= prefillApplied) return
+    prefillApplied = prefill.at
+    api<{ repo: string }>(`/api/review/session/${encodeURIComponent(prefill.sessionId)}`).then(
+      (r) => {
+        preferCurrent.current = r.repo
+        setWithUncommitted(true)
+        setBranch('')
+        if (r.repo === repo) void loadBranches(false)
+        else setRepo(r.repo)
+      },
+      (e) => setError(e.message),
+    )
+  }, [prefill?.at]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // New sessions add repos to the list, so keep it fresh while the form is open.
   useEffect(() => {
@@ -267,13 +295,16 @@ function NewReview({ api, onStarted }: { api: Api; onStarted: (id: string) => vo
       setInfo(b)
       // Keep what you picked if it still exists; otherwise the defaults.
       setBase((cur) => (baseTouched && has(cur) ? cur : b.base))
+      const onCurrent = !!b.current && has(b.current)
       setBranch((cur) =>
-        cur && has(cur) && cur !== b.base
-          ? cur
-          : // The branch you're on, unless that's the base: then the most recently changed one.
-            b.current && b.current !== b.base && has(b.current)
-            ? b.current
-            : (b.branches.find((x) => x.name !== b.base && x.name !== b.base.replace(/^[^/]+\//, ''))?.name ?? ''),
+        preferCurrent.current === repo && onCurrent
+          ? b.current
+          : cur && has(cur) && (cur !== b.base || (cur === b.current && b.dirty > 0))
+            ? cur
+            : // The branch you're on (with uncommitted work, even if it's the base), else the most recently changed one.
+              onCurrent && (b.current !== b.base || b.dirty > 0)
+              ? b.current
+              : (b.branches.find((x) => x.name !== b.base && x.name !== b.base.replace(/^[^/]+\//, ''))?.name ?? ''),
       )
     } catch (e) {
       if (!isStale()) setError((e as Error).message)
@@ -299,7 +330,10 @@ function NewReview({ api, onStarted }: { api: Api; onStarted: (id: string) => vo
     setBusy(true)
     setError('')
     try {
-      const r = await api<{ id: string }>('/api/reviews', { method: 'POST', body: { repo, branch, base, ticket } })
+      const r = await api<{ id: string }>('/api/reviews', {
+        method: 'POST',
+        body: { repo, branch, base, ticket, includeUncommitted: canIncludeUncommitted && withUncommitted },
+      })
       setTicket('')
       onStarted(r.id)
     } catch (e) {
@@ -310,6 +344,9 @@ function NewReview({ api, onStarted }: { api: Api; onStarted: (id: string) => vo
   }
 
   const names = info?.branches.map((b) => b.name) ?? []
+  // Work in progress can be included for the branch that is checked out.
+  const canIncludeUncommitted = !!info && info.dirty > 0 && branch === info.current
+  const uncommittedOnly = canIncludeUncommitted && withUncommitted // then the branch may be the base itself
   return (
     <form
       className="rv-form card"
@@ -327,7 +364,14 @@ function NewReview({ api, onStarted }: { api: Api; onStarted: (id: string) => vo
       <label className="rv-field">
         <span>Repository</span>
         <div className="rv-row">
-          <select value={repo} onChange={(e) => setRepo(e.target.value)} disabled={!repos?.length}>
+          <select
+            value={repo}
+            onChange={(e) => {
+              preferCurrent.current = null
+              setRepo(e.target.value)
+            }}
+            disabled={!repos?.length}
+          >
             {!repos?.length && <option value="">{repos ? 'Waiting for a session…' : 'Loading…'}</option>}
             {(['session', 'added'] as const).map((src) => {
               const list = repos?.filter((r) => r.source === src) ?? []
@@ -385,7 +429,14 @@ function NewReview({ api, onStarted }: { api: Api; onStarted: (id: string) => vo
       <div className="rv-two">
         <label className="rv-field">
           <span>Branch to review</span>
-          <select value={branch} onChange={(e) => setBranch(e.target.value)} disabled={!info}>
+          <select
+            value={branch}
+            onChange={(e) => {
+              preferCurrent.current = null
+              setBranch(e.target.value)
+            }}
+            disabled={!info}
+          >
             <BranchOptions branches={info?.branches ?? []} />
           </select>
         </label>
@@ -436,6 +487,18 @@ function NewReview({ api, onStarted }: { api: Api; onStarted: (id: string) => vo
         )
       })()}
 
+      {canIncludeUncommitted && (
+        <label className="rv-check">
+          <input type="checkbox" checked={withUncommitted} onChange={(e) => setWithUncommitted(e.target.checked)} />
+          <span>
+            Include uncommitted changes{' '}
+            <small>
+              {info.dirty} file{info.dirty === 1 ? '' : 's'} changed in your working copy, reviewed as they are now
+            </small>
+          </span>
+        </label>
+      )}
+
       <label className="rv-field">
         <span>
           Ticket <small>optional</small>
@@ -450,13 +513,13 @@ function NewReview({ api, onStarted }: { api: Api; onStarted: (id: string) => vo
 
       {error && <p className="ap-error">{error}</p>}
       <div className="rv-actions">
-        <button type="submit" className="ap-allow rv-start" disabled={busy || !repo || !branch || !base || branch === base}>
+        <button type="submit" className="ap-allow rv-start" disabled={busy || !repo || !branch || !base || (branch === base && !uncommittedOnly)}>
           {busy ? 'Starting…' : 'Start review'}
         </button>
-        {info && names.length < 2 ? (
+        {info && names.length < 2 && !uncommittedOnly ? (
           <span className="hint">{names.length ? `This repository only has one branch (${names[0]}).` : 'This repository has no branches yet.'} Create a branch to review it.</span>
         ) : (
-          branch && branch === base && <span className="hint">Pick two different branches.</span>
+          branch && branch === base && !uncommittedOnly && <span className="hint">Pick two different branches.</span>
         )}
       </div>
     </form>
@@ -517,7 +580,7 @@ function ReviewDetail({ summary, api, agent, onShowAgent, onSelect }: {
     try {
       const r = await api<{ id: string }>('/api/reviews', {
         method: 'POST',
-        body: { repo: review.repoPath, branch: review.branch, base: review.base, ticket: review.ticket },
+        body: { repo: review.repoPath, branch: review.branch, base: review.base, ticket: review.ticket, includeUncommitted: review.uncommitted ? 'auto' : false },
       })
       onSelect(r.id)
     } catch (e) {
@@ -561,6 +624,7 @@ function ReviewDetail({ summary, api, agent, onShowAgent, onSelect }: {
         <div className="rv-title">
           <h2>
             <Icon.Branch /> {summary.branch}
+            {summary.uncommitted && <span className="rv-wip-badge">+ uncommitted</span>}
             <span className="rv-base">→ {summary.base}</span>
           </h2>
           <div className="rv-meta">

@@ -301,6 +301,77 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$base/api/reviews/$fid"
 gone=$(curl -s -o /dev/null -w '%{http_code}' "$base/api/reviews/$fid" -H "$auth")
 [ "$code" = 200 ] && [ "$gone" = 404 ] && ok "Deleting a review removes it" || bad "delete review: $code, then $gone"
 
+# Work in progress on the checked-out branch (main): a changed file, a staged one and a new one.
+printf 'export function ratio(a, b) {\n  return a / b\n}\n' >"$REPO/app.js"
+printf 'export const staged = 1\n' >"$REPO/staged.js" && g add staged.js
+printf 'export const fresh = 2\n' >"$REPO/new.js"
+before=$(git -C "$REPO" status --porcelain; git -C "$REPO" diff --cached --stat; git -C "$REPO" rev-parse HEAD)
+dirty=$(curl -s -G "$base/api/review/branches" --data-urlencode "repo=$REPO_TOP" -H "$auth" | jget '[v.current,v.dirty].join()')
+[ "$dirty" = "main,3" ] && ok "Branches report the checked-out branch and its uncommitted files" || bad "current/dirty: '$dirty' (want main,3)"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/reviews" -H "$auth" -d "{\"repo\":\"$REPO_TOP\",\"branch\":\"feature\",\"base\":\"main\",\"includeUncommitted\":true}")
+[ "$code" = 400 ] && ok "Uncommitted changes only for the checked-out branch -> 400 otherwise" || bad "uncommitted on another branch -> $code (want 400)"
+wid=$(rpost /api/reviews "{\"repo\":\"$REPO_TOP\",\"branch\":\"main\",\"base\":\"main\",\"includeUncommitted\":true}" | jget v.id)
+st=$(rwait "$wid")
+wv=$(curl -s "$base/api/reviews/$wid" -H "$auth")
+got=$(echo "$wv" | jget '[v.uncommitted, v.stat.startsWith("3 files changed"), v.findings[0].hunk?.lines.includes("-  if (b === 0) return 0")].join()')
+[ "$st" = done ] && [ "$got" = "true,true,true" ] \
+  && ok "Uncommitted changes (changed, staged and new files) are reviewed on the base branch itself" || bad "uncommitted review: '$st' '$got' ($(echo "$wv" | jget v.error))"
+after=$(git -C "$REPO" status --porcelain; git -C "$REPO" diff --cached --stat; git -C "$REPO" rev-parse HEAD)
+[ "$before" = "$after" ] && ok "Your working copy, staging area and HEAD are left as they were" || bad "working copy changed by the review"
+# "Run again" sends 'auto': uncommitted work if the branch is still checked out, else the branch as committed.
+aid=$(rpost /api/reviews "{\"repo\":\"$REPO_TOP\",\"branch\":\"main\",\"base\":\"main\",\"includeUncommitted\":\"auto\"}" | jget v.id)
+st=$(rwait "$aid")
+got=$(curl -s "$base/api/reviews/$aid" -H "$auth" | jget 'String(v.uncommitted)')
+[ "$st" = done ] && [ "$got" = true ] && ok "Run again on the checked-out branch includes the uncommitted work again" || bad "auto on checked-out branch: '$st' uncommitted '$got'"
+aid=$(rpost /api/reviews "{\"repo\":\"$REPO_TOP\",\"branch\":\"feature\",\"base\":\"main\",\"includeUncommitted\":\"auto\"}" | jget v.id)
+st=$(rwait "$aid")
+got=$(curl -s "$base/api/reviews/$aid" -H "$auth" | jget '[String(v.uncommitted), v.stat].join()')
+[ "$st" = done ] && [ "$got" = "undefined,1 file changed, 1 insertion(+), 1 deletion(-)" ] \
+  && ok "Run again after switching branches reviews the branch as committed" || bad "auto on another branch: '$st' '$got'"
+g reset -q && git -C "$REPO" checkout -q -- app.js && rm -f "$REPO/staged.js" "$REPO/new.js"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/reviews" -H "$auth" -d "{\"repo\":\"$REPO_TOP\",\"branch\":\"main\",\"base\":\"main\",\"includeUncommitted\":true}")
+[ "$code" = 400 ] && ok "Nothing committed or uncommitted to review -> 400" || bad "clean main vs main with uncommitted -> $code (want 400)"
+curl -s -o /dev/null -X POST "$base/events" -H "$auth" -d "{\"app\":\"claude\",\"session_id\":\"verify-wip-session\",\"hook_event_name\":\"SessionStart\",\"cwd\":\"$REPO\"}"
+sr=""
+for _ in $(seq 1 20); do
+  sr=$(curl -s "$base/api/review/session/verify-wip-session" -H "$auth" | jget v.repo)
+  [ -n "$sr" ] && break
+  sleep 0.1
+done
+[ "$sr" = "$REPO_TOP" ] && ok "A session's repo is known, for \"Review changes\" on the agent" || bad "session repo: '$sr' (want $REPO_TOP)"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$base/api/review/session/no-such-session" -H "$auth")
+[ "$code" = 404 ] && ok "Unknown session -> 404" || bad "unknown session -> $code (want 404)"
+codes=$(for id in constructor __proto__ toString; do curl -s -o /dev/null -w '%{http_code} ' "$base/api/review/session/$id" -H "$auth"; done)
+alive=$(curl -s "$base/health")
+[ "$codes" = "404 404 404 " ] && [ "$alive" = '{"ok":true}' ] && ok "Session ids like constructor or __proto__ -> 404, server stays up" || bad "prototype-named sessions: '$codes', health '$alive'"
+curl -s -o /dev/null -X POST "$base/events" -H "$auth" -d "{\"app\":\"claude\",\"session_id\":\"__proto__\",\"hook_event_name\":\"SessionStart\",\"cwd\":\"$REPO\"}"
+sr=""
+for _ in $(seq 1 20); do
+  sr=$(curl -s "$base/api/review/session/__proto__" -H "$auth" | jget v.repo)
+  [ -n "$sr" ] && break
+  sleep 0.1
+done
+[ "$sr" = "$REPO_TOP" ] && ok "A session named __proto__ is stored like any other" || bad "__proto__ session repo: '$sr'"
+rpost /api/review/repos "{\"remove\":\"$REPO2_TOP\"}" >/dev/null
+hookcwd() { curl -s -o /dev/null -X POST "$base/events" -H "$auth" -d "{\"app\":\"claude\",\"session_id\":\"$1\",\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Read\",\"cwd\":\"$2\"}"; }
+hookcwd verify-repo-session "$REPO2/sub"
+hookcwd verify-repo-session-2 "$REPO2"
+sleep 0.5
+src=$(curl -s "$base/api/review/repos" -H "$auth" | jget 'v.find(r=>r.path==="'"$REPO2_TOP"'")?.source ?? "none"')
+[ "$src" = none ] && ok "A removed repo stays removed while its sessions keep sending events" || bad "removed repo came back as '$src'"
+sr=$(curl -s "$base/api/review/session/verify-repo-session" -H "$auth" | jget v.repo)
+src=$(curl -s "$base/api/review/repos" -H "$auth" | jget 'v.find(r=>r.path==="'"$REPO2_TOP"'")?.source')
+[ "$sr" = "$REPO2_TOP" ] && [ "$src" = session ] && ok "A session's repo that left the list is offered again when you review it" || bad "dropped repo: '$sr', listed as '$src'"
+REVIEWS_FILE=$(dirname "$DATA")/reviews.json
+sleep 1.2 # let pending saves land
+sum_before=$(shasum "$REVIEWS_FILE" | cut -d' ' -f1)
+for _ in 1 2 3; do hookcwd verify-repo-session "$REPO2/sub"; hookcwd verify-wip-session "$REPO"; done
+sleep 1.2
+sum_after=$(shasum "$REVIEWS_FILE" | cut -d' ' -f1)
+[ -n "$sum_before" ] && [ "$sum_before" = "$sum_after" ] && ok "Sessions alternating between known repos don't rewrite reviews.json" || bad "reviews.json changed on routine hook events"
+left=$(ls "$(git -C "$REPO" rev-parse --absolute-git-dir)" | grep -c agent-control)
+[ "$left" = 0 ] && ok "The snapshot's temporary index is removed" || bad "$left temporary index files left in .git"
+
 # A clone whose remote has moved on: its local main and feature are behind origin.
 CLONE=$REVIEW_TMP/clone
 git clone -q "$REPO" "$CLONE"

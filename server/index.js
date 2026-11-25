@@ -354,7 +354,14 @@ const server = http.createServer((req, res) => {
     if (!authorized(req)) return req.resume(), json(401, { error: 'unauthorized' })
   }
 
-  if (reviews.handle(req, res, url, json, sameOrigin)) return
+  // A bug in review mode answers 500 instead of taking the whole server down.
+  try {
+    if (reviews.handle(req, res, url, json, sameOrigin)) return
+  } catch (e) {
+    console.warn(`Review request failed: ${e.stack ?? e}`)
+    if (!res.headersSent) json(500, { error: 'internal error' })
+    return
+  }
 
   if (req.method === 'POST' && url.pathname === '/events') {
     let body = ''
@@ -371,7 +378,7 @@ const server = http.createServer((req, res) => {
       }
       // Claude Code hook payload, or a plain agent event
       const isHook = typeof ev?.hook_event_name === 'string'
-      if (isHook) reviews.noteCwd(ev.cwd) // offers the session's repo for reviews
+      if (isHook) reviews.noteCwd(ev.cwd, ev.session_id) // offers the session's repo for reviews
       const events = isHook ? mapHook(ev, agents) : [ev]
       if (!events) return json(400, { error: 'unsupported hook payload' })
       let last

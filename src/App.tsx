@@ -149,9 +149,10 @@ interface PanelProps {
   onShowSubagents: () => void
   approvals: ReactNode
   onOpenReview?: () => void // set when this agent is a review's agent
+  onReviewChanges?: () => void // set when the agent's session runs in a git repo
 }
 
-function Panel({ agent, agents, onClose, onStage, canShow, onHide, onShow, removedSubagents, onShowSubagents, approvals, onOpenReview }: PanelProps) {
+function Panel({ agent, agents, onClose, onStage, canShow, onHide, onShow, removedSubagents, onShowSubagents, approvals, onOpenReview, onReviewChanges }: PanelProps) {
   const [, tick] = useState(0)
   useEffect(() => {
     const t = setInterval(() => tick((n) => n + 1), 1000)
@@ -245,6 +246,11 @@ function Panel({ agent, agents, onClose, onStage, canShow, onHide, onShow, remov
             <Icon.Review /> Open review
           </button>
         )}
+        {onReviewChanges && (
+          <button className="panel-button" onClick={onReviewChanges} title="Review the branch and its uncommitted changes">
+            <Icon.Review /> Review changes
+          </button>
+        )}
         {onStage ? (
           <button className="panel-button" onClick={onHide}>
             <Icon.EyeOff /> Remove from dashboard
@@ -301,6 +307,7 @@ export default function App() {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [reviews, setReviews] = useState<ReviewSummary[]>([])
   const [selectedReview, setSelectedReview] = useState<string | null>(() => readPref('ac.review'))
+  const [reviewPrefill, setReviewPrefill] = useState<{ sessionId: string; at: number } | undefined>()
   const selectReview = (id: string | null) => {
     setSelectedReview(id)
     writePref('ac.review', id ?? '')
@@ -687,6 +694,7 @@ export default function App() {
           selected={reviews.some((r) => r.id === selectedReview) ? selectedReview : null}
           onSelect={selectReview}
           onShowAgent={setSelected}
+          prefill={reviewPrefill}
         />
       )}
 
@@ -836,6 +844,17 @@ export default function App() {
           removedSubagents={removedUnder(sel).length}
           onShowSubagents={() => showOnStage(removedUnder(sel).map((a) => a.id))}
           approvals={approvalCards([sel.id], false)}
+          onReviewChanges={(() => {
+            const root = rootOf(sel, byId)
+            // Only sessions in a git repo report a branch; a review's own agent isn't one to review.
+            if (!root.branch || reviews.some((r) => r.agentId === root.id)) return undefined
+            return () => {
+              setReviewPrefill({ sessionId: root.id, at: Date.now() })
+              selectReview(null)
+              changeLayout('review')
+              setSelected(null)
+            }
+          })()}
           onOpenReview={(() => {
             const r = reviews.find((x) => x.agentId === sel.id)
             return r
