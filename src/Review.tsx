@@ -58,6 +58,8 @@ interface Review extends ReviewSummary {
   findings: Finding[]
   error?: string
   cost?: number
+  model?: string
+  effort?: string
 }
 
 type Api = <T>(path: string, init?: { method?: string; body?: unknown }) => Promise<T>
@@ -215,6 +217,25 @@ const writePref = (k: string, v: string) => {
   } catch {}
 }
 
+// Which model reviews: Sonnet by default (strong on code at half Opus's price), Opus for what matters most.
+const MODELS = [
+  ['claude-sonnet-5-5', 'Sonnet 5.5', 'Fast and strong on code. A good default.'],
+  ['claude-opus-5-5', 'Opus 5.5', 'Most thorough, about twice the cost. For big or important changes.'],
+  ['', 'Claude Code default', 'Whatever model your Claude Code uses.'],
+] as const
+const EFFORTS = [
+  ['', 'Default'],
+  ['low', 'Low'],
+  ['medium', 'Medium'],
+  ['high', 'High'],
+  ['xhigh', 'Extra high'],
+] as const
+const modelLabel = (id?: string) => MODELS.find(([m]) => m === (id ?? ''))?.[1] ?? id
+const readChoice = <T extends readonly (readonly [string, ...string[]])[]>(key: string, list: T, fallback: string) => {
+  const v = readPref(key)
+  return v !== null && list.some(([k]) => k === v) ? v : fallback
+}
+
 let prefillApplied = 0 // a prefill is used once, not again when the form opens later
 
 function NewReview({ api, onStarted, prefill }: { api: Api; onStarted: (id: string) => void; prefill?: Props['prefill'] }) {
@@ -229,6 +250,8 @@ function NewReview({ api, onStarted, prefill }: { api: Api; onStarted: (id: stri
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [withUncommitted, setWithUncommitted] = useState(true)
+  const [model, setModel] = useState(() => readChoice('ac.reviewModel', MODELS, 'claude-sonnet-5-5'))
+  const [effort, setEffort] = useState(() => readChoice('ac.reviewEffort', EFFORTS, ''))
   // Set by "Review changes": in that repo, pick the checked-out branch. Picking another repo or
   // branch yourself ends it.
   const preferCurrent = useRef<string | null>(null)
@@ -332,7 +355,7 @@ function NewReview({ api, onStarted, prefill }: { api: Api; onStarted: (id: stri
     try {
       const r = await api<{ id: string }>('/api/reviews', {
         method: 'POST',
-        body: { repo, branch, base, ticket, includeUncommitted: canIncludeUncommitted && withUncommitted },
+        body: { repo, branch, base, ticket, model, effort, includeUncommitted: canIncludeUncommitted && withUncommitted },
       })
       setTicket('')
       onStarted(r.id)
@@ -487,6 +510,44 @@ function NewReview({ api, onStarted, prefill }: { api: Api; onStarted: (id: stri
         )
       })()}
 
+      <div className="rv-two">
+        <label className="rv-field">
+          <span>Model</span>
+          <select
+            value={model}
+            onChange={(e) => {
+              setModel(e.target.value)
+              writePref('ac.reviewModel', e.target.value)
+            }}
+            title={MODELS.find(([m]) => m === model)?.[2]}
+          >
+            {MODELS.map(([id, label]) => (
+              <option key={id} value={id}>
+                {label}
+              </option>
+            ))}
+          </select>
+          <small className="rv-sub">{MODELS.find(([m]) => m === model)?.[2]}</small>
+        </label>
+        <label className="rv-field">
+          <span>Effort</span>
+          <select
+            value={effort}
+            onChange={(e) => {
+              setEffort(e.target.value)
+              writePref('ac.reviewEffort', e.target.value)
+            }}
+          >
+            {EFFORTS.map(([id, label]) => (
+              <option key={id} value={id}>
+                {label}
+              </option>
+            ))}
+          </select>
+          <small className="rv-sub">How long it thinks. Higher finds more, costs more.</small>
+        </label>
+      </div>
+
       {canIncludeUncommitted && (
         <label className="rv-check">
           <input type="checkbox" checked={withUncommitted} onChange={(e) => setWithUncommitted(e.target.checked)} />
@@ -580,7 +641,15 @@ function ReviewDetail({ summary, api, agent, onShowAgent, onSelect }: {
     try {
       const r = await api<{ id: string }>('/api/reviews', {
         method: 'POST',
-        body: { repo: review.repoPath, branch: review.branch, base: review.base, ticket: review.ticket, includeUncommitted: review.uncommitted ? 'auto' : false },
+        body: {
+          repo: review.repoPath,
+          branch: review.branch,
+          base: review.base,
+          ticket: review.ticket,
+          model: review.model ?? '',
+          effort: review.effort ?? '',
+          includeUncommitted: review.uncommitted ? 'auto' : false,
+        },
       })
       onSelect(r.id)
     } catch (e) {
@@ -631,6 +700,12 @@ function ReviewDetail({ summary, api, agent, onShowAgent, onSelect }: {
             <span>{summary.repo}</span>
             {review?.stat && <span>{review.stat}</span>}
             <span>{summary.status === 'running' ? `Running ${fmtDuration(end - summary.createdAt)}` : `Took ${fmtDuration(end - summary.createdAt)}`}</span>
+            {review && (
+              <span>
+                {modelLabel(review.model)}
+                {review.effort ? `, ${review.effort} effort` : ''}
+              </span>
+            )}
             {cost != null && <span>{fmtCost(cost)} est.</span>}
           </div>
         </div>

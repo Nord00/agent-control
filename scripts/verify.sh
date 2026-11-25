@@ -47,7 +47,9 @@ process.stdin.on('data', (c) => (prompt += c)).on('end', () => {
     { severity: 'low', category: 'maintainability', file: 'app.js', line: 1, title: 'Low one', detail: 'd' },
     { severity: 'high', category: 'bug', file: `${process.cwd()}/app.js`, line: 3, title: 'Divides by zero', detail: 'd', scenario: 'b = 0' },
   ]
-  console.log(JSON.stringify({ type: 'result', is_error: false, total_cost_usd: 0.01, num_turns: 2, structured_output: { summary: info, verdict: 'request_changes', ticket: { addressed: 'partly', notes: 'n' }, findings } }))
+  const flag = (f) => (args.includes(f) ? args[args.indexOf(f) + 1] : 'none')
+  const notes = `model=${flag('--model')} effort=${flag('--effort')}` // what the review was run with
+  console.log(JSON.stringify({ type: 'result', is_error: false, total_cost_usd: 0.01, num_turns: 2, structured_output: { summary: info, verdict: 'request_changes', ticket: { addressed: 'partly', notes }, findings } }))
 })
 JS
 chmod +x "$STUB"
@@ -292,6 +294,17 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/reviews/$rid/fi
 [ "$code" = 400 ] && ok "Unknown finding status -> 400" || bad "bad finding status -> $code (want 400)"
 got=$(curl -s "$base/api/reviews" -H "$auth" | jget 'v[0].id+" "+(v[0].findings===undefined)')
 [ "$got" = "$rid true" ] && ok "Review list has summaries without the findings" || bad "review list: '$got'"
+
+got=$(echo "$rv" | jget 'v.ticketCoverage.notes')
+[ "$got" = "model=none effort=none" ] && ok "Without a model or effort, the review uses Claude Code's defaults" || bad "default model/effort: '$got'"
+mid=$(rpost /api/reviews "{\"repo\":\"$REPO_TOP\",\"branch\":\"feature\",\"base\":\"main\",\"ticket\":\"t\",\"model\":\"claude-opus-5-5\",\"effort\":\"high\"}" | jget v.id)
+st=$(rwait "$mid")
+got=$(curl -s "$base/api/reviews/$mid" -H "$auth" | jget '[v.ticketCoverage?.notes, v.model, v.effort].join()')
+[ "$st" = done ] && [ "$got" = "model=claude-opus-5-5 effort=high,claude-opus-5-5,high" ] \
+  && ok "The chosen model and effort reach the review agent and are kept" || bad "model/effort: '$st' '$got'"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/reviews" -H "$auth" -d "{\"repo\":\"$REPO_TOP\",\"branch\":\"feature\",\"base\":\"main\",\"model\":\"gpt-5\"}")
+code2=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/reviews" -H "$auth" -d "{\"repo\":\"$REPO_TOP\",\"branch\":\"feature\",\"base\":\"main\",\"effort\":\"--dangerously-skip-permissions\"}")
+[ "$code" = 400 ] && [ "$code2" = 400 ] && ok "Unknown model or effort -> 400" || bad "bad model -> $code, bad effort -> $code2 (want 400, 400)"
 
 fid=$(rpost /api/reviews "{\"repo\":\"$REPO_TOP\",\"branch\":\"feature\",\"base\":\"main\",\"ticket\":\"PLEASE-FAIL\"}" | jget v.id)
 st=$(rwait "$fid")

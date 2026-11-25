@@ -20,6 +20,9 @@ const CATEGORIES = ['bug', 'security', 'ticket', 'performance', 'maintainability
 const VERDICTS = ['approve', 'comment', 'request_changes']
 const COVERAGE = ['yes', 'partly', 'no', 'unclear']
 const FINDING_STATUSES = new Set(['open', 'accepted', 'dismissed'])
+// Models a review may run on ('' = your Claude Code default) and effort levels ('' = the model's default).
+const MODELS = ['', 'claude-sonnet-5-5', 'claude-opus-5-5']
+const EFFORTS = ['', 'low', 'medium', 'high', 'xhigh']
 
 // Read-only: it can look at files and git history, and nothing else. dontAsk refuses the rest
 // instead of waiting for a prompt nobody would see.
@@ -422,6 +425,10 @@ export function createReviews({ dataDir, broadcast }) {
     if (!known(repo)) throw new Error('Unknown repository: add it first')
     const { branch, base } = body
     if (!refOk(branch) || !refOk(base)) throw new Error('Pick a branch and a base branch')
+    const model = body.model ?? ''
+    const effort = body.effort ?? ''
+    if (!MODELS.includes(model)) throw new Error(`Unknown model: ${String(model).slice(0, 40)}`)
+    if (!EFFORTS.includes(effort)) throw new Error(`Unknown effort: ${String(effort).slice(0, 20)}`)
     // true: include the uncommitted work (the branch must be checked out). 'auto' (Run again):
     // include it if the branch is still checked out, else review the branch as committed.
     const current = (await git(repo, ['branch', '--show-current']).catch(() => '')).trim()
@@ -456,6 +463,8 @@ export function createReviews({ dataDir, broadcast }) {
       stat,
       uncommitted,
       ticket: text(body.ticket, 20000),
+      model: model || undefined,
+      effort: effort || undefined,
       sessionId: crypto.randomUUID(),
       worktree: path.join(WORKTREES, `${slug(path.basename(repo))}-review-${slug(branch)}-${id}`),
       status: 'running',
@@ -485,6 +494,8 @@ export function createReviews({ dataDir, broadcast }) {
       '--json-schema', JSON.stringify(SCHEMA),
       '--session-id', r.sessionId,
       '--name', `Review: ${r.branch}`.slice(0, 40),
+      ...(r.model ? ['--model', r.model] : []),
+      ...(r.effort ? ['--effort', r.effort] : []),
       '--permission-mode', 'dontAsk',
       '--allowedTools', ...ALLOWED_TOOLS,
       '--disallowedTools', ...DISALLOWED_TOOLS,
